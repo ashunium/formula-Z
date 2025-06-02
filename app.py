@@ -42,10 +42,10 @@ TRACKS_INFO = {
 
 WEATHER_OPTIONS = ["☀️ Sunny", "🌦️ Light Rain", "🌧️ Heavy Rain", "☁️ Cloudy", "🌬️ Windy"]
 
-# Global in-memory race sessions indexed by channel id
+
 lobbies = {}
 
-career_stats = {}  # Keeps career stats for each player
+career_stats = {}  
 
 default_player_profile = {
     "races": 0,
@@ -71,9 +71,8 @@ def load_career_stats():
         with open("career_stats.json", "r") as f:
             career_stats = json.load(f)
     except FileNotFoundError:
-        career_stats = {}  # No file yet, so create a new one
+        career_stats = {}  
 
-# Call this function when the bot starts up
 
 
 @bot.command()
@@ -89,7 +88,7 @@ async def create(ctx):
     initial_weather = random.choice(WEATHER_OPTIONS)
     track_info = TRACKS_INFO[track_name]
 
-    # 40% chance to have mid-race weather change
+    
     has_weather_change = random.random() < 0.4
 
     weather_window = {}
@@ -98,7 +97,7 @@ async def create(ctx):
         start = random.randint(total_laps // 3, total_laps // 2)
         end = random.randint(start + 3, min(total_laps, start + 10))
 
-        # Choose a different weather than initial
+       
         new_weather = random.choice([w for w in WEATHER_OPTIONS if w != initial_weather])
 
         weather_window = {
@@ -117,7 +116,7 @@ async def create(ctx):
         "status": "waiting"
     }
 
-    # Inform about weather change if it exists
+    
     embed = discord.Embed(
         title="🏁 New Race Lobby Created!",
         description=f"{ctx.author.mention} has created a race lobby in this channel.",
@@ -153,15 +152,15 @@ async def set(ctx, *, track_name: str):
         await ctx.send("🚫 Only the host can set the track.")
         return
 
-    # Validate the track name
+   
     if track_name not in TRACKS_INFO:
-        # Suggest closest matching tracks (optional, basic)
+        
         possible_tracks = [t for t in TRACKS_INFO if track_name.lower() in t.lower()]
         suggestion = f" Did you mean: {', '.join(possible_tracks)}?" if possible_tracks else ""
         await ctx.send(f"⚠️ Invalid track name.{suggestion}")
         return
 
-    # Update track
+    
     lobby["track"] = track_name
     track_info = TRACKS_INFO[track_name]
 
@@ -232,20 +231,20 @@ async def leave(ctx):
         await ctx.send("🙃 You're not part of this race.")
         return
 
-    # ✅ Prevent leaving after the race has started
+    
     if lobby["status"] != "waiting":
         await ctx.send("🚫 You can't leave the race after it has started!")
         return
 
     lobby["players"].remove(user_id)
 
-    # If host left
+    
     if user_id == lobby["host"]:
         await ctx.send("⚠️ The host left. Race lobby is closed.")
         del lobbies[channel_id]
         return
 
-    # If no players left
+    
     if not lobby["players"]:
         await ctx.send("🏁 All players have left. The race lobby is now closed.")
         del lobbies[channel_id]
@@ -276,18 +275,18 @@ async def start(ctx):
         await ctx.send("❌ You need at least 2 players to start the race.")
         return
 
-    # Init race state
+    
     lobby["status"] = "in_progress"
     lobby["current_lap"] = 1
-    lobby["position_order"] = random.sample(lobby["players"], len(lobby["players"]))  # Random grid
+    lobby["position_order"] = random.sample(lobby["players"], len(lobby["players"]))  
     track = TRACKS_INFO[lobby["track"]]
     total_laps = track["laps"]
 
-    # Random weather
+    
     weather = random.choice(["Sunny", "Rainy", "Cloudy", "Windy"])
     lobby["weather"] = weather
 
-    # Initialize player data and send strategy panels
+    
     lobby["player_data"] = {}
     lobby["users"] = {}
 
@@ -338,26 +337,25 @@ async def start(ctx):
         except Exception as e:
             print(f"❌ Error creating or sending strategy panel for user {pid}: {e}")
 
-    # Initial race embed
-   # 🎬 Step 1: Show starting lights GIF
+    
     lights_gif_embed = discord.Embed(
         title="🔴🔴🔴🔴🟢 Lights Out!",
         description="Get ready to race...",
         color=discord.Color.red()
     )
-    lights_gif_embed.set_image(url="https://media.tenor.com/RtrDuGASCoMAAAAM/f1.gif")  # Or use your preferred link
+    lights_gif_embed.set_image(url="https://media.tenor.com/RtrDuGASCoMAAAAM/f1.gif")  
 
     await ctx.send(embed=lights_gif_embed)
 
-# ⏱️ Step 2: Wait for the GIF duration (adjust as needed)
+
     await asyncio.sleep(7)  # 6 seconds is typical for race lights
 
-# ✅ Step 3: Send initial race status embed
+
     embed = generate_race_status_embed(lobby)
     msg = await ctx.send(embed=embed)
     lobby["status_msg_id"] = msg.id
 
-# 🚀 Step 4: Start race loop
+
     bot.loop.create_task(race_loop(ctx, channel_id, msg, total_laps))
 
 async def race_loop(ctx, channel_id, status_msg, total_laps):
@@ -367,14 +365,14 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
         lobby = lobbies[channel_id]
         current_lap = lobby["current_lap"]
 
-    # Weather switch logic (window-based)
+    
         window = lobby.get("weather_window", {})
         start = window.get("start")
         end = window.get("end")
         new_weather = window.get("new_weather")
         initial_weather = lobby.get("initial_weather", lobby["weather"])
 
-    # Decide current weather
+    
         if start and end and start <= current_lap <= end:
             if lobby["weather"] != new_weather:
                 lobby["weather"] = new_weather
@@ -387,7 +385,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             break
 
         await asyncio.sleep(lap_delay)
-    # continue with the rest of race logic...
+    
 
         base_lap_time = TRACKS_INFO[lobby["track"]]["lap_record_sec"] * 1.10
         weather = lobby["weather"]
@@ -439,24 +437,24 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 }.get(pdata["tyre"], 1.0)
 
                 tyre_wear = base_wear * tyre_type_wear
-            # Modify tyre wear based on weather + tyre combo
+            
             if weather == "🌦️ Light Rain":
                 if tyre == "Intermediate":
-                    tyre_wear *= 0.85  # ✅ Best choice
+                    tyre_wear *= 0.85  
                 elif tyre == "Wet":
-                    tyre_wear *= 1.15  # Too much grip = overheating
+                    tyre_wear *= 1.15  
 
             elif weather == "🌧️ Heavy Rain":
                 if tyre == "Intermediate":
-                    tyre_wear *= 1.10  # Slippery
+                    tyre_wear *= 1.10  
                 elif tyre == "Wet":
-                    tyre_wear *= 0.75  # ✅ Ideal
+                    tyre_wear *= 0.75  
 
             else:  # Dry weather (Sunny, Cloudy, Windy)
                 if tyre == "Wet":
-                    tyre_wear *= 1.6  # Melts fast
+                    tyre_wear *= 1.6  
                 elif tyre == "Intermediate":
-                    tyre_wear *= 1.3  # Overheats
+                    tyre_wear *= 1.3  
 
                 pdata["fuel"] = max(pdata.get("fuel", 100.0) - fuel_usage, 0)
                 pdata["tyre_condition"] = max(pdata.get("tyre_condition", 100.0) - tyre_wear, 0)
@@ -484,14 +482,14 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 ("🌦️ Light Rain", "Soft"): 1.35,
                 ("🌦️ Light Rain", "Medium"): 1.25,
                 ("🌦️ Light Rain", "Hard"): 1.30,
-                ("🌦️ Light Rain", "Intermediate"): 1.00,  # ✅ best
-                ("🌦️ Light Rain", "Wet"): 1.10,           # slightly too much
+                ("🌦️ Light Rain", "Intermediate"): 1.00,  
+                ("🌦️ Light Rain", "Wet"): 1.10,           
 
                 ("🌧️ Heavy Rain", "Soft"): 1.50,
                 ("🌧️ Heavy Rain", "Medium"): 1.40,
                 ("🌧️ Heavy Rain", "Hard"): 1.45,
-                ("🌧️ Heavy Rain", "Intermediate"): 1.15,  # too slippery
-                ("🌧️ Heavy Rain", "Wet"): 1.00,           # ✅ best
+                ("🌧️ Heavy Rain", "Intermediate"): 1.15,  
+                ("🌧️ Heavy Rain", "Wet"): 1.00,           
 
                 ("☁️ Cloudy", "Soft"): 1.00,
                 ("☁️ Cloudy", "Medium"): 1.00,
@@ -507,13 +505,12 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             }.get((weather, tyre), 1.15)
 
 
-            # Calculate tyre and fuel degradation penalties
+            
             tyre_wear_penalty = 1 + ((100 - pdata["tyre_condition"]) / 100) * 0.10  # up to +10%
             fuel_penalty = 1 + ((100 - pdata["fuel"]) / 100) * 0.05  # up to +5%
 
-# Final lap time with degradation effects
-            # Small driver performance variation for realism
-            driver_variance = random.uniform(0.985, 1.015)  # ±1.5% variation
+
+            driver_variance = random.uniform(0.985, 1.015)  
             lap_time = (base_lap_time * strat_factor * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
 
 
@@ -582,7 +579,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             except Exception as e:
                 print(f"⚠️ Failed to update DM for {user.display_name}: {e}")
 
-    # Race finished — announce final results
+    
     final_order = lobby["position_order"]
     embed = discord.Embed(
         title=f"🏁 Race Finished — {lobby['track']}",
@@ -632,18 +629,18 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
         if pos <= 3:
             profile["podiums"] += 1
 
-    # Fastest lap check (you can improve this later to track per-lap times)
+    
         if not profile["fastest_lap"] or pdata["total_time"] / TRACKS_INFO[lobby["track"]]["laps"] < profile["fastest_lap"]:
             profile["fastest_lap"] = pdata["total_time"] / TRACKS_INFO[lobby["track"]]["laps"]
 
     for pid in lobby["players"]:
         pdata = lobby["player_data"][pid]
-        if pdata.get("dnf", False):  # If the player has a DNF status
+        if pdata.get("dnf", False):  
             profile = get_player_profile(pid)
-            profile["dnfs"] += 1  # Increment the DNF count for the player
+            profile["dnfs"] += 1  
 
 
-    save_career_stats()  # Save stats at the end of each race
+    save_career_stats()  
 
 
     await ctx.send(embed=embed)
@@ -695,7 +692,7 @@ def generate_race_status_embed(lobby):
 
     leader_time = player_data[position_order[0]]["total_time"]
 
-    # Show all players: position_order first, then DNFs not in it
+    
     visible_players = position_order + [pid for pid in lobby["players"] if pid not in position_order]
 
     for pos, pid in enumerate(visible_players):
@@ -706,7 +703,7 @@ def generate_race_status_embed(lobby):
         pdata = player_data[pid]
 
         if pdata.get("dnf", False):
-            continue  # DNFs handled separately later
+            continue  
 
 
         user = users[pid]
@@ -724,7 +721,7 @@ def generate_race_status_embed(lobby):
             time_gap = total_time - leader_time
             gap = f"+{time_gap:.3f}s"
 
-        # Pit stop message
+        
         if strategy == "Pit Stop" and pdata.get("last_pit_lap", 0) != current_lap:
             driver_line = f"**P{pos+1}** `{user.display_name}` • 🛞 Pitting..."
         else:
@@ -732,7 +729,7 @@ def generate_race_status_embed(lobby):
 
         embed.add_field(name="\u200b", value=driver_line, inline=False)
 
-    # Add DNF list
+    
     dnf_players = [pid for pid, pdata in player_data.items() if pdata.get("dnf", False)]
     if dnf_players:
         dnf_names = [users[pid].display_name for pid in dnf_players]
@@ -777,14 +774,14 @@ class StrategyPanelView(View):
         if view.choice:
             pdata = lobbies[self.channel_id]["player_data"][self.user_id]
 
-        # ✅ Update tyre choice
+        
             pdata["tyre"] = view.choice
 
-        # ✅ Refill fuel and tyre condition
+        
             pdata["fuel"] = 100.0
             pdata["tyre_condition"] = 100.0
 
-        # ✅ Track pit stop and set default strategy
+        
             pdata["last_pit_lap"] = lobbies[self.channel_id]["current_lap"]
             pdata["strategy"] = "Balanced"
 
@@ -802,7 +799,7 @@ class TyreView(View):
         self.choice = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only allow the correct user to interact
+        
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ This isn't your pit crew, mate.", ephemeral=True)
             return False
@@ -841,7 +838,7 @@ async def help(ctx):
         color=discord.Color.teal()
     )
 
-    # How to Play
+    
     embed.add_field(
         name="🕹️ How to Play",
         value=(
@@ -855,7 +852,7 @@ async def help(ctx):
         inline=False
     )
 
-    # Weather and Tyre Effects (simplified)
+    
     embed.add_field(
         name="🌦️ Weather Tips",
         value=(
@@ -867,7 +864,7 @@ async def help(ctx):
         inline=False
     )
 
-    # Tyres and Strategy
+    
     embed.add_field(
         name="🛞 Tyres & 📊 Strategy",
         value=(
@@ -889,7 +886,7 @@ async def help(ctx):
     embed.set_footer(text="Use your DM panel to adjust strategy during the race.")
     await ctx.send(embed=embed)
 
-# Add this to the bottom of your file
+
 @bot.event
 async def on_ready():
     load_career_stats()  # This will load the career stats from the file
@@ -910,7 +907,7 @@ async def profile(ctx, member: discord.Member = None):
         millis = int((secs % 1) * 1000)
         return f"{int(hours)}:{int(minutes):02}:{int(secs):02}.{millis:03}"
 
-    # Calculate average race time if races > 0
+    
     average_time = profile["total_time"] / profile["races"] if profile["races"] > 0 else 0
     fastest_lap = format_race_time(profile["fastest_lap"]) if profile["fastest_lap"] else "—"
 
