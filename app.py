@@ -1,3 +1,4 @@
+import datetime
 import discord
 from discord.ext import commands
 import random
@@ -55,6 +56,19 @@ default_player_profile = {
     "fastest_lap": None,
     "total_time": 0.0
 }
+GAME_MODES = {
+    "solos": {
+        "min_players": 2,
+        "max_players": 20,
+        "team_size": 1
+    },
+    "duos": {
+        "min_players": 4,
+        "max_players": 20,
+        "team_size": 2,
+        "require_even": True
+    }
+}
 
 def get_player_profile(user_id):
     if user_id not in career_stats:
@@ -110,10 +124,10 @@ async def create(ctx):
         "host": user_id,
         "track": track_name,
         "weather": initial_weather,
-        "initial_weather": initial_weather,
-        "weather_window": weather_window,
         "players": [user_id],
-        "status": "waiting"
+        "status": "waiting",
+        "mode": "solos",  
+        "teams": {}       
     }
 
     
@@ -274,7 +288,14 @@ async def start(ctx):
     if len(lobby["players"]) < 2:
         await ctx.send("❌ You need at least 2 players to start the race.")
         return
-
+    
+    if lobby["mode"] == "duos":
+        if len(lobby["players"]) % 2 != 0:
+            await ctx.send("❌ Duos mode requires an even number of players.")
+            return
+        
+        if not lobby.get("teams"):
+            _generate_teams(lobby)  
     
     lobby["status"] = "in_progress"
     lobby["current_lap"] = 1
@@ -580,14 +601,18 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 print(f"⚠️ Failed to update DM for {user.display_name}: {e}")
 
     
-    final_order = lobby["position_order"]
+        final_order = lobby["position_order"]
     embed = discord.Embed(
         title=f"🏁 Race Finished — {lobby['track']}",
-        description=f"**Weather:** {lobby['weather']}",
-        color=discord.Color.green()
+        description=f"**Weather:** {lobby['weather']} • **Mode:** {lobby['mode'].title()}",
+        color=discord.Color.gold()
     )
 
-    podium_emojis = ["🥇", "🥈", "🥉"]
+    # Point system
+    POINT_SYSTEM = {
+        1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
+        6: 8, 7: 6, 8: 4, 9: 2, 10: 1
+    }
 
     def format_race_time(seconds):
         minutes, secs = divmod(seconds, 60)
@@ -595,49 +620,98 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
         millis = int((secs % 1) * 1000)
         return f"{int(hours)}:{int(minutes):02}:{int(secs):02}.{millis:03}"
 
-    leader_time = None
-    if final_order:
-        leader_time = lobby["player_data"][final_order[0]]["total_time"]
+    leader_time = lobby["player_data"][final_order[0]]["total_time"] if final_order else 0
 
-    for pos, pid in enumerate(final_order, start=1):
-        user = lobby["users"][pid]
-        pdata = lobby["player_data"][pid]
-        total_time = pdata["total_time"]
+    if lobby["mode"] == "solos":
+        # Solo race results (unchanged)
+        podium_emojis = ["🥇", "🥈", "🥉"]
+        for pos, pid in enumerate(final_order, start=1):
+            user = lobby["users"][pid]
+            pdata = lobby["player_data"][pid]
+            total_time = pdata["total_time"]
 
-        if pos == 1:
-            time_display = format_race_time(total_time)
-        else:
-            gap = total_time - leader_time
-            time_display = f"+{gap:.3f}s"
+            if pos == 1:
+                time_display = format_race_time(total_time)
+            else:
+                gap = total_time - leader_time
+                time_display = f"+{gap:.3f}s"
 
-        medal = podium_emojis[pos-1] if pos <= 3 else f"{pos}️⃣"
-        embed.add_field(name=medal, value=f"{user.display_name} — `{time_display}`", inline=False)
+            medal = podium_emojis[pos-1] if pos <= 3 else f"{pos}️⃣"
+            points = POINT_SYSTEM.get(pos, 0)
+            embed.add_field(
+                name=f"{medal} {user.display_name}",
+                value=f"`{time_display}` • {points} pts",
+                inline=False
+            )
 
+    else:
+        # Duos race results WITH TIME GAPS
+        team_results = {}
+        
+        # Calculate team points and gather time data
+        for pos, pid in enumerate(final_order, start=1):
+            team_id = next((tid for tid, pids in lobby["teams"].items() if pid in pids), None)
+            if team_id:
+                points = POINT_SYSTEM.get(pos, 0)
+                total_time = lobby["player_data"][pid]["total_time"]
+                
+                if team_id not in team_results:
+                    team_results[team_id] = {
+                        "points": 0,
+                        "members": [],
+                        "best_pos": pos
+                    }
+                team_results[team_id]["points"] += points
+                team_results[team_id]["members"].append({
+                    "id": pid,
+                    "position": pos,
+                    "time": total_time,
+                    "gap": total_time - leader_time
+                })
+
+        # Sort teams by total points (then by best single position)
+        sorted_teams = sorted(
+            team_results.items(),
+            key=lambda x: (-x[1]["points"], x[1]["best_pos"])
+        )
+
+        # Display team results with individual time gaps
+        for team_pos, (team_id, data) in enumerate(sorted_teams, start=1):
+            member_lines = []
+            for member in sorted(data["members"], key=lambda x: x["position"]):
+                user = lobby["users"][member["id"]]
+                time_display = (
+                    format_race_time(member["time"]) if member["position"] == 1 
+                    else f"+{member['gap']:.3f}s"
+                )
+                member_lines.append(
+                    f"P{member['position']} {user.display_name} • `{time_display}` • {POINT_SYSTEM.get(member['position'], 0)} pts"
+                )
+
+            medal = "🥇" if team_pos == 1 else ("🥈" if team_pos == 2 else ("🥉" if team_pos == 3 else f"{team_pos}."))
+            embed.add_field(
+                name=f"{medal} Team {team_id} • {data['points']} pts",
+                value="\n".join(member_lines),
+                inline=False
+            )
+             # Handle DNFs
     dnfs = [pid for pid in lobby["players"] if lobby["player_data"][pid].get("dnf", False)]
     if dnfs:
-        embed.add_field(name="DNF", value="\n".join(lobby["users"][pid].display_name for pid in dnfs), inline=False)
-
-    for pos, pid in enumerate(final_order, start=1):
-        pdata = lobby["player_data"][pid]
-        profile = get_player_profile(pid)
-
-        profile["races"] += 1
-        profile["total_time"] += pdata["total_time"]
-
-        if pos == 1:
-            profile["wins"] += 1
-        if pos <= 3:
-            profile["podiums"] += 1
-
-    
-        if not profile["fastest_lap"] or pdata["total_time"] / TRACKS_INFO[lobby["track"]]["laps"] < profile["fastest_lap"]:
-            profile["fastest_lap"] = pdata["total_time"] / TRACKS_INFO[lobby["track"]]["laps"]
-
-    for pid in lobby["players"]:
-        pdata = lobby["player_data"][pid]
-        if pdata.get("dnf", False):  
+        dnf_list = []
+        for pid in dnfs:
+            user = lobby["users"][pid]
+            dnf_lap = lobby["player_data"][pid].get("dnf_lap", "?")
+            dnf_list.append(f"{user.display_name} (Lap {dnf_lap})")
+            
+            # Update career stats for DNFs
             profile = get_player_profile(pid)
-            profile["dnfs"] += 1  
+            profile["dnfs"] += 1
+
+        embed.add_field(
+            name="❌ DNFs",
+            value="\n".join(dnf_list),
+            inline=False
+        )
 
 
     save_career_stats()  
@@ -927,6 +1001,351 @@ async def profile(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
+@bot.command()
+async def leaderboard(ctx):
+    """Displays a clean, formatted leaderboard of top racers."""
+    if not career_stats:
+        embed = discord.Embed(
+            title="🏆 F1 Leaderboard",
+            description="No race data yet! Start racing with `!create`.",
+            color=discord.Color.gold()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    sorted_stats = sorted(
+        career_stats.items(),
+        key=lambda x: (
+            -x[1].get("wins", 0),
+            -x[1].get("podiums", 0),
+            -x[1].get("races", 0)
+        )
+    )
+
+    embed = discord.Embed(
+        title="🏆 Formula Z Global Leaderboard",
+        color=discord.Color.gold()
+    )
+    embed.set_image(url="https://montreal.citynews.ca/wp-content/blogs.dir/sites/19/2021/12/Max-Verstappen.png")  
+
+    leaderboard_text = []
+    medal_emojis = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+    for idx, (user_id, stats) in enumerate(sorted_stats[:10], 1):  
+        try:
+            user = await bot.fetch_user(int(user_id))
+            name = user.display_name
+        except:
+            name = f"Unknown ({user_id})"
+
+        medal = medal_emojis[idx-1] if idx <= 10 else f"{idx}."
+        
+        line = (
+            f"{medal} **{name}**\n"
+            f"`🏁 {stats.get('wins',0)} wins` | "
+            f"`🥈 {stats.get('podiums',0)} podiums` | "
+            f"`🏎️ {stats.get('races',0)} races`"
+        )
+        leaderboard_text.append(line)
+
+    embed.description = "\n\n".join(leaderboard_text)
+    
+    # Add win percentage for top 3
+    if len(sorted_stats) >= 1:
+        top = sorted_stats[0][1]
+        if top.get('races', 0) > 0:
+            win_rate = (top['wins'] / top['races']) * 100
+            embed.add_field(
+                name="👑 Champion Stats",
+                value=f"Win Rate: {win_rate:.1f}%\nFastest Lap: {top.get('fastest_lap', 'N/A')}s",
+                inline=False
+            )
+    await ctx.send(embed=embed)
+
+@bot.command(aliases=['ch'])
+async def changehost(ctx, new_host: discord.Member):
+    """Transfer host privileges to another player (Host only)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active race lobby in this channel.")
+        return
+    
+    lobby = lobbies[channel_id]
+    
+    if ctx.author.id != lobby["host"]:
+        await ctx.send("🚫 Only the current host can transfer host privileges.")
+        return
+    
+    if new_host.id not in lobby["players"]:
+        await ctx.send(f"❌ {new_host.mention} is not in this race.")
+        return
+    
+    old_host = lobby["host"]
+    lobby["host"] = new_host.id
+    
+    embed = discord.Embed(
+        title="👑 Host Changed",
+        description=f"{ctx.author.mention} has transferred host privileges to {new_host.mention}.",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)  
+async def forcehost(ctx, new_host: discord.Member):
+    """Forcefully change host (Admin only)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active race lobby in this channel.")
+        return
+    
+    lobby = lobbies[channel_id]
+    
+    # Check if new host is in the race
+    if new_host.id not in lobby["players"]:
+        await ctx.send(f"❌ {new_host.mention} is not in this race.")
+        return
+    
+    # Change host
+    old_host = lobby["host"]
+    lobby["host"] = new_host.id
+    
+    embed = discord.Embed(
+        title="⚡ Host Changed (Admin Override)",
+        description=f"{ctx.author.mention} has assigned {new_host.mention} as the new host.",
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def kick(ctx, member: discord.Member):
+    """Kick a player from the race (Host only)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active race lobby in this channel.")
+        return
+    
+    lobby = lobbies[channel_id]
+    
+    # Check if command user is host
+    if ctx.author.id != lobby["host"]:
+        await ctx.send("🚫 Only the host can kick players.")
+        return
+    
+    # Check if member is in the race
+    if member.id not in lobby["players"]:
+        await ctx.send(f"❌ {member.mention} is not in this race.")
+        return
+    
+    # Cannot kick yourself
+    if member.id == ctx.author.id:
+        await ctx.send("🤨 You can't kick yourself. Use `!leave` instead.")
+        return
+    
+    # Remove player
+    lobby["players"].remove(member.id)
+    
+    # If kicked player was in position_order, remove them
+    if member.id in lobby.get("position_order", []):
+        lobby["position_order"].remove(member.id)
+    
+    # If kicked player had player_data, remove it
+    if member.id in lobby.get("player_data", {}):
+        del lobby["player_data"][member.id]
+    
+    embed = discord.Embed(
+        title="🚪 Player Kicked",
+        description=f"{member.mention} has been removed from the race by {ctx.author.mention}.",
+        color=discord.Color.orange()
+    )
+    await ctx.send(embed=embed)
+@bot.command(aliases=['cm'])
+async def changemode(ctx, mode: str = None):
+    """Switch between Solos (1-player teams) and Duos (2-player teams)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active lobby in this channel.")
+        return
+    
+    lobby = lobbies[channel_id]
+    
+    # Only host can change mode
+    if ctx.author.id != lobby["host"]:
+        await ctx.send("🚫 Only the host can change game mode.")
+        return
+    
+    # Check if race already started
+    if lobby["status"] != "waiting":
+        await ctx.send("⚠️ Cannot change mode after race has started.")
+        return
+    
+    mode = mode.lower() if mode else None
+    
+    # Validate mode
+    if mode not in GAME_MODES:
+        valid_modes = ", ".join(GAME_MODES.keys())
+        await ctx.send(f"❌ Invalid mode. Choose: {valid_modes}")
+        return
+    
+    # Check player count requirements
+    min_players = GAME_MODES[mode]["min_players"]
+    if len(lobby["players"]) < min_players:
+        await ctx.send(f"❌ Need at least {min_players} players for {mode} mode.")
+        return
+    
+    # For duos: enforce even number of players
+    if mode == "duos" and len(lobby["players"]) % 2 != 0:
+        await ctx.send("❌ Duos mode requires an even number of players.")
+        return
+    
+    # Update mode and auto-generate teams if switching to duos
+    lobby["mode"] = mode
+    if mode == "duos":
+        _generate_teams(lobby)  # Randomly assign teams
+    
+    embed = discord.Embed(
+        title=f"🔄 Mode Changed → {mode.upper()}",
+        description=f"Host {ctx.author.mention} set the mode to **{mode}**.",
+        color=discord.Color.blurple()
+    )
+    
+    if mode == "duos":
+        embed.add_field(
+            name="Teams",
+            value=_format_teams(lobby),
+            inline=False
+        )
+        embed.set_footer(text="Use !swap to adjust teams.")
+    
+    await ctx.send(embed=embed)
+
+def _generate_teams(lobby):
+    """Randomly assign teams for duos mode"""
+    players = lobby["players"].copy()
+    random.shuffle(players)
+    
+    lobby["teams"] = {}
+    for i in range(0, len(players), 2):
+        team_id = i // 2 + 1
+        lobby["teams"][team_id] = players[i:i+2]
+
+def _format_teams(lobby):
+    """Format teams for display in embeds"""
+    return "\n".join(
+        f"**Team {team_id}:** {', '.join([f'<@{pid}>' for pid in players])}"
+        for team_id, players in lobby["teams"].items()
+    )
+
+@bot.command()
+async def swap(ctx, player1: discord.Member, player2: discord.Member):
+    """Swap two players between teams (Host only)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active lobby in this channel.")
+        return
+    
+    lobby = lobbies[channel_id]
+    
+    # Only host can swap
+    if ctx.author.id != lobby["host"]:
+        await ctx.send("🚫 Only the host can swap players.")
+        return
+    
+    # Check if in duos mode
+    if lobby["mode"] != "duos":
+        await ctx.send("❌ Team swapping only works in Duos mode.")
+        return
+    
+    # Find which teams the players are in
+    team1_id = next((tid for tid, pids in lobby["teams"].items() if player1.id in pids), None)
+    team2_id = next((tid for tid, pids in lobby["teams"].items() if player2.id in pids), None)
+    
+    if not team1_id or not team2_id:
+        await ctx.send("❌ One or both players not found in teams.")
+        return
+    
+    # Perform swap
+    lobby["teams"][team1_id].remove(player1.id)
+    lobby["teams"][team2_id].remove(player2.id)
+    lobby["teams"][team1_id].append(player2.id)
+    lobby["teams"][team2_id].append(player1.id)
+    
+    embed = discord.Embed(
+        title="🔄 Players Swapped",
+        description=(
+            f"{player1.mention} ↔️ {player2.mention}\n\n"
+            f"**Updated Teams:**\n{_format_teams(lobby)}"
+        ),
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+@bot.command()
+async def racers(ctx):
+    """Show all racers in the lobby (team-wise in Duos mode)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active race lobby in this channel.")
+        return
+    
+    lobby = lobbies[channel_id]
+    players = lobby["players"]
+    
+    # Fetch all usernames (handle deleted users gracefully)
+    player_names = []
+    for player_id in players:
+        try:
+            user = await bot.fetch_user(player_id)
+            player_names.append(user.display_name)
+        except:
+            player_names.append(f"Unknown ({player_id})")
+    
+    embed = discord.Embed(
+        title=f"🏎️ Racers in Lobby ({len(players)}/{GAME_MODES[lobby['mode']]['max_players']})",
+        color=discord.Color.blue()
+    )
+    
+    if lobby["mode"] == "solos":
+        # Solos mode: Simple list
+        embed.description = "\n".join(
+            f"🏁 {name}" 
+            for name in player_names
+        )
+        embed.set_footer(text="Solos Mode • Every racer for themselves!")
+    else:
+        # Duos mode: Team display
+        if not lobby.get("teams"):
+            _generate_teams(lobby)  # Auto-generate if missing
+            
+        for team_id, player_ids in lobby["teams"].items():
+            teammates = []
+            for pid in player_ids:
+                try:
+                    user = await bot.fetch_user(pid)
+                    teammates.append(user.display_name)
+                except:
+                    teammates.append(f"Unknown ({pid})")
+            
+            embed.add_field(
+                name=f"🚗 Team {team_id}",
+                value=" • ".join(teammates),
+                inline=False
+            )
+        embed.set_footer(text="Duos Mode • Team up for victory!")
+    
+    # Show host
+    try:
+        host_user = await bot.fetch_user(lobby["host"])
+        embed.set_author(name=f"Host: {host_user.display_name}")
+    except:
+        pass
+    
+    await ctx.send(embed=embed)
 def save_on_exit():
     save_career_stats()
 
