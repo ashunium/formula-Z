@@ -425,7 +425,7 @@ async def start(ctx):
     bot.loop.create_task(race_loop(ctx, channel_id, msg, total_laps))
 
 async def race_loop(ctx, channel_id, status_msg, total_laps):
-    lap_delay = 20  
+    lap_delay = 5 
 
     while channel_id in lobbies:
         lobby = lobbies[channel_id]
@@ -479,7 +479,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             last_pit_lap = pdata.get("last_pit_lap", -2)
 
             if strategy == "Pit Stop" and last_pit_lap != current_lap:
-                pit_penalty = 3.0  
+                pit_penalty = 20.0  
                 pdata["last_pit_lap"] = current_lap
                 print(f"🛞 PIT STOP TRIGGERED for {pid} on lap {current_lap}")
                 print(f"Before reset: Fuel={pdata.get('fuel')}, Tyre condition={pdata.get('tyre_condition')}")
