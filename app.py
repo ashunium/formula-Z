@@ -1,4 +1,3 @@
-
 import discord
 from discord.ext import commands
 import random
@@ -59,12 +58,12 @@ default_player_profile = {
     "races": 0, "wins": 0, "podiums": 0, "dnfs": 0, "fastest_lap": None, "total_time": 0.0, "points": 0
 }
 
-async def safe_send(channel, content, retries=3, delay=5):
+async def safe_send(channel, content=None, embed=None, retries=3, delay=5):
     for attempt in range(retries):
         try:
-            if isinstance(content, discord.Embed):
-                await channel.send(embed=content)
-            else:
+            if embed:
+                await channel.send(embed=embed)
+            elif content:
                 await channel.send(content)
             return
         except (discord.HTTPException, discord.Forbidden) as e:
@@ -144,7 +143,7 @@ async def create(ctx):
     lobbies[channel_id] = {
         "host": user_id, "track": track_name, "weather": initial_weather, "initial_weather": initial_weather,
         "weather_window": weather_window, "players": [user_id], "users": {user_id: ctx.author},
-        "status": "waiting", "mode": "solo", "teams": []
+        "status": "waiting", "mode": "solo", "teams": [], "team_names": {}
     }
     embed = discord.Embed(
         title="🏁 New Race Lobby Created!", description=f"{ctx.author.mention} has created a race lobby in this channel.",
@@ -296,9 +295,14 @@ async def start(ctx):
             user = await bot.fetch_user(pid)
             logger.info(f"✅ Successfully fetched user {pid}: {user.name}")
             lobby["users"][pid] = user
+            initial_tyre = "Medium"
+            initial_strategy = "Balanced"
+            if "initial_settings" in lobby and pid in lobby["initial_settings"]:
+                initial_tyre = lobby["initial_settings"][pid]["tyre"]
+                initial_strategy = lobby["initial_settings"][pid]["strategy"]
             lobby["player_data"][pid] = {
-                "strategy": "Balanced",
-                "tyre": "Medium",
+                "strategy": initial_strategy,
+                "tyre": initial_tyre,
                 "last_pit_lap": 0,
                 "total_time": 0.0,
                 "fuel": 100.0,
@@ -387,7 +391,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 base_lap_time = TRACKS_INFO[track]["lap_record_sec"] * 1.1
             else:
                 logger.error(f"Invalid track {track} in lobby {channel_id}")
-                base_lap_time = 90.0
+                base_lap_time = 100.0
             weather = lobby["weather"]
             player_times = {}
             for pid in lobby["players"]:
@@ -415,7 +419,6 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     pdata["fuel"] = 100.0
                     pdata["tyre_condition"] = 100.0
                     logger.debug(f"After reset: Fuel={pdata['fuel']}, Tyre condition={pdata['tyre_condition']}")
-                    pdata["strategy"] = "Balanced"
                     just_pitted = True
                 if not just_pitted:
                     fuel_usage = {"Push": 6.0, "Balanced": 4.0, "Save": 2.0}.get(strategy, 4.0)
@@ -461,7 +464,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     "Push": 0.95,
                     "Balanced": 1.0,
                     "Save": 1.05,
-                    "Pit Stop": 1.3
+                    "Pit Stop": 1.15
                 }.get(strategy, 1.0)
                 weather_penalty = {
                     ("☀️ Sunny", "Soft"): 1.0,
@@ -540,7 +543,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         description=(
                             f"📍 You are currently **P{position}** out of **{total}**.\n"
                             f"🏁 Lap **{current_lap}/{total_laps}**\n"
-                            f"🌦 Weather: **{weather_emoji}**\n"
+                            f"Weather: **{weather_emoji}**\n"
                             f"⛽ Fuel: **{fuel}%**\n"
                             f"🛞 Tyre Condition: **{tyre_cond}%**"
                         ),
@@ -572,7 +575,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
         final_order = lobby["position_order"]
         embed = discord.Embed(
             title=f"🏆 {lobby['track']} Grand Prix — Results",
-            description=f"🌦 Weather: {lobby['weather']}",
+            description=f"Weather: {lobby['weather']}",
             color=discord.Color.green()
         )
         podium_emojis = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
@@ -651,7 +654,7 @@ def generate_race_status_embed(lobby):
     users = lobby.get("users", {})
     embed = discord.Embed(
         title=f"🏎️ {track} Grand Prix",
-        description=f"🌦 **Weather:** {weather} • **Lap:** {current_lap}/{total_laps}",
+        description=f"**Weather:** {weather} • **Lap:** {current_lap}/{total_laps}",
         color=discord.Color.red() if "Sunny" in weather else (
             discord.Color.blue() if "Rain" in weather else discord.Color.blurple()
         )
@@ -690,10 +693,12 @@ def generate_race_status_embed(lobby):
             prev_time = player_data.get(prev_pid, {}).get("total_time", 0.0)
             time_gap = total_time - prev_time
             gap = f"+{time_gap:.3f}s"
+        team_number = pos // 2 + 1
+        team_name = lobby.get("team_names", {}).get(team_number, f"Team {team_number}")
         if strategy == "Pit Stop" and pdata.get("last_pit_lap", 0) != current_lap:
-            driver_line = f"**P{pos}** `{user.name}` • 🛞 Pitting..."
+            driver_line = f"**P{pos}** `{user.name}` ({team_name}) • 🛞 Pitting..."
         else:
-            driver_line = f"**P{pos}** `{user.name}` • {tyre_display} • {strat_display} {strategy} • `{gap}`"
+            driver_line = f"**P{pos}** `{user.name}` ({team_name}) • {tyre_display} • {strat_display} {strategy} • `{gap}`"
         embed.add_field(name="\u200b", value=driver_line, inline=False)
     dnf_players = [pid for pid, pdata in player_data.items() if pdata.get("dnf", False)]
     if dnf_players:
@@ -813,6 +818,7 @@ async def help(ctx):
             "`!lb` – View the global leaderboard\n"
             "`!profile` – View your career stats: points, races, wins, podiums, DNFs, fastest lap\n"
             "`!lobby` – Check all racers in the lobby\n"
+            "`!setstrat <tyre> <strat>` – Set your initial strat before the race, eg: !setstrat Soft Push\n"
         ),
         inline=False
     )
@@ -907,25 +913,26 @@ async def lobby(ctx):
         lobby_found["users"] = {ctx.author.id: ctx.author}
     embed = discord.Embed(
         title=f"🏎️ {track} Grand Prix Lobby",
-        description=f"🌦 **Weather:** {weather} • **Mode:** {lobby_found['mode'].capitalize()}",
+        description=f"**Weather:** {weather} • **Mode:** {lobby_found['mode'].capitalize()}",
         color=discord.Color.blue()
     )
     if lobby_found["mode"] == "duo":
         team_display = []
-        for i, team in enumerate(lobby_found["teams"], 1):
-            team_names = []
-            for pid in team:
-                user = lobby_found["users"].get(pid)
-                if not user:
-                    try:
-                        user = await bot.fetch_user(pid)
-                        lobby_found["users"][pid] = user
-                    except (discord.NotFound, discord.HTTPException):
-                        logger.warning(f"Failed to fetch user {pid} for lobby display")
-                        continue
-                team_names.append(user.name)
-            if team_names:
-                team_display.append(f"**Team {i}**: {team_names[0]} & {team_names[1]}")
+for i, team in enumerate(lobby_found["teams"], 1):
+    team_names = []
+    for pid in team:
+        user = lobby_found["users"].get(pid)
+        if not user:
+            try:
+                user = await bot.fetch_user(pid)
+                lobby_found["users"][pid] = user
+            except (discord.NotFound, discord.HTTPException):
+                logger.warning(f"Failed to fetch user {pid} for lobby display")
+                continue
+        team_names.append(user.name)
+    if team_names:
+        team_name = lobby_found.get("team_names", {}).get(i, f"Team {i}")
+        team_display.append(f"**{team_name}**: {team_names[0]} & {team_names[1]}")
         embed.add_field(
             name="🤝 Teams in Lobby",
             value="\n".join(team_display) if team_display else "No teams assigned yet.",
@@ -1289,5 +1296,61 @@ async def leaderboard(ctx):
     )
     embed.set_footer(text="Race to earn points and climb the leaderboard!")
     await ctx.send(embed=embed)
+
+@bot.command()
+async def setstrat(ctx, tyre: str = None, strat: str = None):
+    channel_id = ctx.channel.id
+    user_id = ctx.author.id
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active race lobby in this channel.")
+        return
+    lobby = lobbies[channel_id]
+    if lobby["status"] != "waiting":
+        await ctx.send("🚫 You can only set your strategy before the race starts.")
+        return
+    if user_id not in lobby["players"]:
+        await ctx.send("🙃 You're not in this race lobby. Use `!join` first.")
+        return
+    valid_tyres = ["Soft", "Medium", "Hard", "Intermediate", "Wet"]
+    valid_strats = ["Push", "Balanced", "Save"]
+    if not tyre or tyre not in valid_tyres:
+        await ctx.send(f"⚠️ Invalid tyre. Choose from: {', '.join(valid_tyres)}")
+        return
+    if not strat or strat not in valid_strats:
+        await ctx.send(f"⚠️ Invalid strategy. Choose from: {', '.join(valid_strats)}")
+        return
+    if "initial_settings" not in lobby:
+        lobby["initial_settings"] = {}
+    lobby["initial_settings"][user_id] = {"tyre": tyre, "strategy": strat}
+    await ctx.send(f"✅ {ctx.author.mention} set initial strategy: **{tyre}** tyres, **{strat}** strategy.")
+
+@bot.command()
+async def ctn(ctx, team_number: int = None, *, custom_name: str = None):
+    channel_id = ctx.channel.id
+    user_id = ctx.author.id
+    if channel_id not in lobbies:
+        await ctx.send("❌ No active race lobby in this channel.")
+        return
+    lobby = lobbies[channel_id]
+    if lobby["host"] != user_id:
+        await ctx.send("🚫 Only the host can change team names.")
+        return
+    if lobby["status"] != "waiting":
+        await ctx.send("🚫 Team names can only be changed before the race starts.")
+        return
+    if team_number is None or team_number < 1 or team_number > 10:
+        await ctx.send("⚠️ Invalid team number. Choose a number between 1 and 10.")
+        return
+    if custom_name is None or len(custom_name.strip()) == 0:
+        await ctx.send("⚠️ Invalid team name. Provide a non-empty team name.")
+        return
+    if len(custom_name) > 50:
+        await ctx.send("⚠️ Team name too long. Keep it under 50 characters.")
+        return
+    if "team_names" not in lobby:
+        lobby["team_names"] = {}
+    lobby["team_names"][team_number] = custom_name.strip()
+    await ctx.send(f"✅ Team {team_number} name set to **{custom_name.strip()}**.")
+
 
 
