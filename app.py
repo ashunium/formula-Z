@@ -55,7 +55,7 @@ F1_POINTS = {
 lobbies = {}
 career_stats = {}
 default_player_profile = {
-    "races": 0, "wins": 0, "podiums": 0, "dnfs": 0, "fastest_lap": None, "total_time": 0.0, "points": 0
+    "races": 0, "wins": 0, "podiums": 0, "dnfs": 0, "fastest_lap": None, "total_time": 0.0, "points": 0, "skill_rating": 50
 }
 
 async def safe_send(channel, content=None, embed=None, retries=3, delay=5):
@@ -385,7 +385,28 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             if weather_updates:
                 await safe_send(ctx, "\n".join(weather_updates))
             if current_lap > total_laps:
-                break
+                break            
+            incident_chance = 0.05  # 5% per lap
+            if random.random() < incident_chance and not lobby.get("safety_car_laps", 0) and lobby.get("status", "racing") == "racing":
+                incident_type = random.choice(["Safety Car", "Red Flag", "Crash"])
+                if incident_type == "Safety Car":
+                    lobby["safety_car_laps"] = random.randint(1, 3)
+                    await safe_send(ctx, "🚨 **Safety Car Deployed!** Slower laps for the next few laps.")
+                elif incident_type == "Red Flag":
+                    lobby["status"] = "red_flag"
+                    for pid in lobby["players"]:
+                        if pid in lobby["users"]:
+                            user = lobby["users"][pid]
+                            await user.send("⛔ **Red Flag!** Race paused. Adjust your strategy in the panel.")
+                    await safe_send(ctx, "⛔ **Red Flag!** Race paused. Host, use `!resume` to continue.")
+                    return  # Exit race_loop until resumed
+                elif incident_type == "Crash":
+                    eligible_players = [pid for pid in lobby["players"] if not lobby["player_data"][pid].get("dnf", False)]
+                    if eligible_players:
+                        crash_pid = random.choice(eligible_players)
+                        lobby["player_data"][crash_pid]["dnf"] = True
+                        lobby["player_data"][crash_pid]["dnf_reason"] = "Collision"
+                        await safe_send(ctx, f"💥 **Crash!** `{lobby['users'][crash_pid].name}` is out!")
             track = lobby.get("track")
             if track in TRACKS_INFO:
                 base_lap_time = TRACKS_INFO[track]["lap_record_sec"] * 1.1
@@ -460,12 +481,24 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         await safe_send(ctx, f"❌ `{lobby['users'][pid].name}` DNFed: {pdata['dnf_reason']}!")
                     else:
                         logger.warning(f"User {pid} not found in lobby during DNF")
-                strat_factor = {
-                    "Push": 0.95,
-                    "Balanced": 1.0,
-                    "Save": 1.05,
-                    "Pit Stop": 1.15
-                }.get(strategy, 1.0)
+
+                if lobby.get("safety_car_laps", 0) > 0:
+                    strat_factor = {k: v * 1.2 for k, v in {
+                        "Push": 0.95,
+                        "Balanced": 1.0,
+                        "Save": 1.05,
+                        "Pit Stop": 1.15
+                    }.items()}  # Slow all strategies
+                    lobby["safety_car_laps"] -= 1
+                    if lobby["safety_car_laps"] == 0:
+                        await safe_send(ctx, "🏁 **Safety Car In!** Normal racing resumes.")
+                else:
+                    strat_factor = {
+                        "Push": 0.95,
+                        "Balanced": 1.0,
+                        "Save": 1.05,
+                        "Pit Stop": 1.15
+                    }
                 weather_penalty = {
                     ("☀️ Sunny", "Soft"): 1.0,
                     ("☀️ Sunny", "Medium"): 1.02,
@@ -495,7 +528,8 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 }.get((weather, tyre), 1.0)
                 tyre_wear_penalty = 1.0 + ((100.0 - pdata["tyre_condition"]) / 100.0) * 0.1
                 fuel_penalty = 1.0 + ((100.0 - pdata["fuel"]) / 100.0) * 0.05
-                driver_variance = random.uniform(0.98, 1.02)
+                skill_rating = pdata.get("skill_rating", 50)
+                driver_variance = random.uniform(0.98, 1.02) * (1 - (skill_rating - 50) / 1000)  # Higher skill → faster
                 lap_time = (base_lap_time * strat_factor * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
                 pdata["lap_times"].append(lap_time)
                 pdata["total_time"] += lap_time
@@ -635,6 +669,13 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     logger.info(f"🏅 New fastest lap for {pid}: {fastest_lap_in_race:.2f}s")
             if pdata.get("dnf", False):
                 profile["dnfs"] += 1
+            pos = final_order.index(pid) + 1 if pid in final_order else None
+            if pos == 1:
+                profile["skill_rating"] = min(100, profile["skill_rating"] + 5)  # Win
+            elif pos and pos <= 3:
+                profile["skill_rating"] = min(100, profile["skill_rating"] + 2)  # Podium
+            if pdata.get("dnf", False):
+                profile["skill_rating"] = max(1, profile["skill_rating"] - 2)  # DNF
         save_career_stats()
         await safe_send(ctx, embed=embed)
         del lobbies[channel_id]
@@ -886,6 +927,7 @@ async def profile(ctx, user: discord.User = None):
         inline=True
     )
     embed.add_field(name="Points", value=str(profile["points"]), inline=True)
+    embed.add_field(name="Skill Rating", value=str(profile["skill_rating"]), inline=True)
     embed.set_footer(text="Keep racing to climb the leaderboard!")
     await ctx.send(embed=embed)
 
@@ -1353,5 +1395,16 @@ async def ctn(ctx, team_number: int = None, *, custom_name: str = None):
     lobby["team_names"][team_number] = custom_name.strip()
     await ctx.send(f"✅ Team {team_number} name set to **{custom_name.strip()}**.")
 
-
+@bot.command()
+async def resume(ctx):
+    if ctx.channel.id not in lobbies or lobbies[ctx.channel.id]["host"] != ctx.author.id:
+        await ctx.send("🚫 Only the host can resume the race.")
+        return
+    lobby = lobbies[ctx.channel.id]
+    if lobby["status"] != "red_flag":
+        await ctx.send("❌ No red flag to resume from.")
+        return
+    lobby["status"] = "racing"
+    await ctx.send("🏁 **Race Resumed!**")
+    await race_loop(ctx, ctx.channel.id, lobby["status_msg_id"], TRACKS_INFO[lobby["track"]]["laps"])
 
