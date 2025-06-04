@@ -388,25 +388,45 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 break            
             incident_chance = 0.05  # 5% per lap
             if random.random() < incident_chance and not lobby.get("safety_car_laps", 0) and lobby.get("status", "racing") == "racing":
-                incident_type = random.choice(["Safety Car", "Red Flag", "Crash"])
-                if incident_type == "Safety Car":
-                    lobby["safety_car_laps"] = random.randint(1, 3)
-                    await safe_send(ctx, "🚨 **Safety Car Deployed!** Slower laps for the next few laps.")
-                elif incident_type == "Red Flag":
-                    lobby["status"] = "red_flag"
-                    for pid in lobby["players"]:
-                        if pid in lobby["users"]:
-                            user = lobby["users"][pid]
-                            await user.send("⛔ **Red Flag!** Race paused. Adjust your strategy in the panel.")
-                    await safe_send(ctx, "⛔ **Red Flag!** Race paused. Host, use `!resume` to continue.")
-                    return  # Exit race_loop until resumed
-                elif incident_type == "Crash":
-                    eligible_players = [pid for pid in lobby["players"] if not lobby["player_data"][pid].get("dnf", False)]
-                    if eligible_players:
-                        crash_pid = random.choice(eligible_players)
-                        lobby["player_data"][crash_pid]["dnf"] = True
-                        lobby["player_data"][crash_pid]["dnf_reason"] = "Collision"
-                        await safe_send(ctx, f"💥 **Crash!** `{lobby['users'][crash_pid].name}` is out!")
+                # Replace incident block in race_loop (lines ~30-45)
+            for pid in lobby["players"]:
+                if lobby.get("safety_car_laps", 0) or lobby.get("status", "racing") != "racing":
+                    continue  # Skip incidents during Safety Car or non-racing status
+                strategy = lobby["player_data"][pid].get("strategy", "Balanced")
+                incident_chance = 0.10 if strategy == "Push" else 0.05  # Higher for Push
+                if random.random() < incident_chance:
+                    incident_type = random.choices(
+                        ["collision", "mechanical", "safety_car", "red_flag"],
+                        weights=[0.5, 0.3, 0.15, 0.05] if strategy == "Push" else [0.4, 0.3, 0.2, 0.1]
+                    )[0]
+                    if incident_type == "collision" and not lobby["player_data"][pid].get("dnf", False):
+                        lobby["player_data"][pid]["dnf"] = True
+                        lobby["player_data"][pid]["dnf_reason"] = "Collision"
+                        profile = get_player_profile(pid)
+                        profile["ZCoins"] += 5
+                        save_player_profile(pid, profile)
+                        user = lobby["users"].get(pid)
+                        await safe_send(ctx, f"💥 **Crash!** `{user.name}` has DNF'd due to a collision! (+5 <:ZCoin:1379843253641285723> ZC)")
+                    elif incident_type == "mechanical" and not lobby["player_data"][pid].get("dnf", False):
+                        lobby["player_data"][pid]["dnf"] = True
+                        lobby["player_data"][pid]["dnf_reason"] = "Mechanical Failure"
+                        profile = get_player_profile(pid)
+                        profile["ZCoins"] += 5
+                        save_player_profile(pid, profile)
+                        user = lobby["users"].get(pid)
+                        await safe_send(ctx, f"🔧 **Mechanical Failure!** `{user.name}` has DNF'd! (+5 <:ZCoin:1379843253641285723> ZC)")
+                    elif incident_type == "safety_car" and not lobby.get("safety_car_laps", 0):
+                        lobby["safety_car_laps"] = random.randint(1, 3)
+                        await safe_send(ctx, f"🚨 **Safety Car Deployed!** Slower laps for {lobby['safety_car_laps']} laps.")
+                    elif incident_type == "red_flag":
+                        lobby["status"] = "red_flag"
+                        for pid in lobby["players"]:
+                            if pid in lobby["users"]:
+                                user = lobby["users"][pid]
+                                await user.send("⛔ **Red Flag!** Race paused. Adjust your strategy in the panel.")
+                        await safe_send(ctx, "⛔ **Red Flag!** Race paused. Host, use `!resume` to continue.")
+                        return  # Exit race_loop until resumed
+                
             track = lobby.get("track")
             if track in TRACKS_INFO:
                 base_lap_time = TRACKS_INFO[track]["lap_record_sec"] * 1.1
