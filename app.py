@@ -55,7 +55,7 @@ F1_POINTS = {
 lobbies = {}
 career_stats = {}
 default_player_profile = {
-    "races": 0, "wins": 0, "podiums": 0, "dnfs": 0, "fastest_lap": None, "total_time": 0.0, "points": 0, "skill_rating": 50
+    "races": 0, "wins": 0, "podiums": 0, "dnfs": 0, "fastest_lap": None, "total_time": 0.0, "points": 0, "skill_rating": 50, "ZCoins": 0, "last_daily": 0.0, "last_weekly": 0.0, "last_monthly": 0.0
 }
 
 async def safe_send(channel, content=None, embed=None, retries=3, delay=5):
@@ -614,6 +614,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
         )
         podium_emojis = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
         leader_time = lobby["player_data"][final_order[0]]["total_time"] if final_order else None
+        # ... earlier race_loop code ...
         for pos, pid in enumerate(final_order, 1):
             user = lobby["users"].get(pid)
             if not user:
@@ -625,14 +626,24 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 gap = total_time - leader_time
                 time_display = f"+{gap:.3f}s"
             points = F1_POINTS.get(pos, 0)
+            zcoins = 50 if pos == 1 else 30 if pos == 2 else 20 if pos == 3 else 0
+            zcoins += 10  # Participation
             pos_display = podium_emojis.get(pos, f"{pos}.")
             embed.add_field(
                 name=f"P{pos} {pos_display}",
-                value=f"{user.name} — `{time_display}` — {points} pts",
+                value=f"{user.name} — `{time_display}` — {points} pts — +{zcoins} <:ZCoin:1379843253641285723> ZC",
                 inline=True
             )
             profile = get_player_profile(pid)
             profile["points"] += points
+            profile["ZCoins"] += zcoins
+            profile["skill_rating"] = profile.get("skill_rating", 50)
+            if pos == 1:
+                profile["skill_rating"] = min(100, profile["skill_rating"] + 5)  # Win
+            elif pos <= 3:
+                profile["skill_rating"] = min(100, profile["skill_rating"] + 2)  # Podium
+            save_player_profile(pid, profile)
+
         dnf_players = [pid for pid, pdata in lobby["player_data"].items() if pdata.get("dnf", False)]
         if dnf_players:
             dnf_names = [f"{lobby['users'].get(pid, {'name': f'Unknown ({pid})'}).name} — {lobby['player_data'][pid]['dnf_reason']}" for pid in dnf_players if pid in lobby["users"]]
@@ -641,6 +652,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 value="\n".join(dnf_names) if dnf_names else "No DNFs recorded.",
                 inline=False
             )
+
         if lobby["mode"] == "duo":
             team_points = {}
             for team_idx, team in enumerate(lobby["teams"]):
@@ -651,6 +663,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 value="\n".join(team_scores) if team_scores else "No team scores.",
                 inline=False
             )
+
         for pid in lobby["players"]:
             pdata = lobby["player_data"].get(pid, {})
             profile = get_player_profile(pid)
@@ -669,16 +682,15 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     logger.info(f"🏅 New fastest lap for {pid}: {fastest_lap_in_race:.2f}s")
             if pdata.get("dnf", False):
                 profile["dnfs"] += 1
-            pos = final_order.index(pid) + 1 if pid in final_order else None
-            if pos == 1:
-                profile["skill_rating"] = min(100, profile["skill_rating"] + 5)  # Win
-            elif pos and pos <= 3:
-                profile["skill_rating"] = min(100, profile["skill_rating"] + 2)  # Podium
-            if pdata.get("dnf", False):
+                profile["skill_rating"] = profile.get("skill_rating", 50)
                 profile["skill_rating"] = max(1, profile["skill_rating"] - 2)  # DNF
+            if pid not in final_order[:3]:  # Only add participation ZCoins for non-podium players
+                profile["ZCoins"] += 10
+                save_player_profile(pid, profile)
         save_career_stats()
         await safe_send(ctx, embed=embed)
         del lobbies[channel_id]
+# ... exception handling ...
     except Exception as e:
         logger.error(f"🏃‍♂️ Race loop failed: {e}")
         await safe_send(ctx, "❌ The race crashed! Please try creating a new lobby with `!create`.")
@@ -1408,3 +1420,88 @@ async def resume(ctx):
     await ctx.send("🏁 **Race Resumed!**")
     await race_loop(ctx, ctx.channel.id, lobby["status_msg_id"], TRACKS_INFO[lobby["track"]]["laps"])
 
+@bot.command(name="coins")
+async def coins(ctx):
+    user_id = ctx.author.id
+    profile = get_player_profile(user_id)
+    embed = discord.Embed(
+        title=f"💸 {ctx.author.name}'s ZCoins",
+        description=f"**ZCoins**: {profile['ZCoins']} <:ZCoin:1379843253641285723> ZC",
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="Earn more by racing! Shop and upgrades coming soon!")
+    await ctx.send(embed=embed)
+
+import time
+
+@bot.command(name="daily")
+async def daily(ctx):
+    user_id = ctx.author.id
+    profile = get_player_profile(user_id)
+    current_time = time.time()
+    cooldown = 24 * 3600
+    last_daily = profile.get("last_daily", 0.0)
+    if current_time - last_daily < cooldown:
+        remaining = int(cooldown - (current_time - last_daily))
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        await ctx.send(f"⏳ You've already claimed your daily reward! Try again in {hours}h {minutes}m.")
+        return
+    profile["ZCoins"] += 50
+    profile["last_daily"] = current_time
+    save_player_profile(user_id, profile)
+    embed = discord.Embed(
+        title="🎉 Daily Reward Claimed!",
+        description=f"You received **50 <:ZCoin:1379843253641285723> ZC**! Check your balance with `!coins`.",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Come back tomorrow for more!")
+    await ctx.send(embed=embed)
+
+@bot.command(name="weekly")
+async def weekly(ctx):
+    user_id = ctx.author.id
+    profile = get_player_profile(user_id)
+    current_time = time.time()
+    cooldown = 7 * 24 * 3600
+    last_weekly = profile.get("last_weekly", 0.0)
+    if current_time - last_weekly < cooldown:
+        remaining = int(cooldown - (current_time - last_weekly))
+        days = remaining // (24 * 3600)
+        hours = (remaining % (24 * 3600)) // 3600
+        await ctx.send(f"⏳ You've already claimed your weekly reward! Try again in {days}d {hours}h.")
+        return
+    profile["ZCoins"] += 200
+    profile["last_weekly"] = current_time
+    save_player_profile(user_id, profile)
+    embed = discord.Embed(
+        title="🏆 Weekly Reward Claimed!",
+        description=f"You received **200 <:ZCoin:1379843253641285723> ZC**! Check your balance with `!coins`.",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Come back next week for more!")
+    await ctx.send(embed=embed)
+
+@bot.command(name="monthly")
+async def monthly(ctx):
+    user_id = ctx.author.id
+    profile = get_player_profile(user_id)
+    current_time = time.time()
+    cooldown = 30 * 24 * 3600
+    last_monthly = profile.get("last_monthly", 0.0)
+    if current_time - last_monthly < cooldown:
+        remaining = int(cooldown - (current_time - last_monthly))
+        days = remaining // (24 * 3600)
+        hours = (remaining % (24 * 3600)) // 3600
+        await ctx.send(f"⏳ You've already claimed your monthly reward! Try again in {days}d {hours}h.")
+        return
+    profile["ZCoins"] += 500
+    profile["last_monthly"] = current_time
+    save_player_profile(user_id, profile)
+    embed = discord.Embed(
+        title="🌟 Monthly Reward Claimed!",
+        description=f"You received **500 <:ZCoin:1379843253641285723> ZC**! Check your balance with `!coins`.",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Come back next month for more!")
+    await ctx.send(embed=embed)
