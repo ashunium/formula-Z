@@ -868,11 +868,12 @@ async def on_ready():
     logger.info(f'🚀 {bot.user} has connected to Discord!')
 
 @bot.command()
-async def profile(ctx):
-    user_id = ctx.author.id
+async def profile(ctx, user: discord.User = None):
+    target_user = user if user else ctx.author
+    user_id = target_user.id
     profile = get_player_profile(user_id)
     embed = discord.Embed(
-        title=f"🏎️ {ctx.author.name}'s Career Profile",
+        title=f"🏎️ {target_user.name}'s Career Profile",
         color=discord.Color.blue()
     )
     embed.add_field(name="Races", value=str(profile["races"]), inline=True)
