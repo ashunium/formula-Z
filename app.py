@@ -395,7 +395,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             if current_lap > total_laps:
                 break            
             incident_chance = 0.99  # Set to 0.05 for production
-            if random.random() < incident_chance and not lobby.get("safety_car_laps", 0) and lobby.get("status", "racing") == "racing":
+            if random.random() < incident_chance and not lobby.get("safety_car_laps", 0) and lobby.get("status") == "in_progress":
                 logger.debug(f"🎲 Incident triggered on lap {current_lap} with {incident_chance*100}% chance")
                 valid_players = [pid for pid in lobby["players"] if not lobby["player_data"].get(pid, {}).get("dnf", False)]
                 if valid_players:
@@ -414,7 +414,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         save_player_profile(pid, profile)
                         user = lobby["users"].get(pid)
                         await safe_send(ctx, f"💥 **Crash!** `{user.name}` has DNF'd due to a collision! (+5 {get_zcoin_emoji(ctx.guild)} ZC)")
-                     elif incident_type == "mechanical" and not lobby["player_data"][pid].get("dnf", False):
+                    elif incident_type == "mechanical" and not lobby["player_data"][pid].get("dnf", False):
                         lobby["player_data"][pid]["dnf"] = True
                         lobby["player_data"][pid]["dnf_reason"] = "Mechanical Failure"
                         profile = get_player_profile(pid)
@@ -422,10 +422,10 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         save_player_profile(pid, profile)
                         user = lobby["users"].get(pid)
                         await safe_send(ctx, f"🔧 **Mechanical Failure!** `{user.name}` has DNF'd! (+5 {get_zcoin_emoji(ctx.guild)} ZC)")
-                     elif incident_type == "safety_car" and not lobby.get("safety_car_laps", 0):
+                    elif incident_type == "safety_car" and not lobby.get("safety_car_laps", 0):
                         lobby["safety_car_laps"] = random.randint(1, 3)
                         await safe_send(ctx, f"🚨 **Safety Car Deployed!** Slower laps for {lobby['safety_car_laps']} laps.")
-                     elif incident_type == "red_flag":
+                    elif incident_type == "red_flag":
                         lobby["status"] = "red_flag"
                         for pid in lobby["players"]:
                             if pid in lobby["users"]:
@@ -460,7 +460,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 pit_penalty = 0
                 last_pit_lap = pdata.get("last_pit_lap", -2)
                 if last_pit_lap == current_lap:
-                    pit_penalty = 20.0
+                    pit_penalty = 25.0
                     logger.info(f"🛞 PIT STOP TRIGGERED for {pid} on lap {current_lap} (P{lobby['position_order'].index(pid)+1})")
                     logger.debug(f"Before reset: Fuel={pdata.get('fuel')}, Tyre condition={pdata.get('tyre_condition')}")
                     pdata["fuel"] = 100.0
