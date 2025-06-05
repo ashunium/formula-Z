@@ -52,6 +52,8 @@ F1_POINTS = {
     1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1
 }
 
+zcoin_emoji = "<:ZCoin:1379843253641285723>"
+
 lobbies = {}
 career_stats = {}
 default_player_profile = {
@@ -411,7 +413,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         profile["ZCoins"] += 5
                         save_player_profile(pid, profile)
                         user = lobby["users"].get(pid)
-                        await safe_send(ctx, f"💥 **Crash!** `{user.name}` has DNF'd due to a collision! (+5 <:ZCoin:1379843253641285723> ZC)")
+                        await safe_send(ctx, f"💥 **Crash!** `{user.name}` has DNF'd due to a collision! (+5 {zcoin_emoji} ZC)")
                     elif incident_type == "mechanical" and not lobby["player_data"][pid].get("dnf", False):
                         lobby["player_data"][pid]["dnf"] = True
                         lobby["player_data"][pid]["dnf_reason"] = "Mechanical Failure"
@@ -419,7 +421,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         profile["ZCoins"] += 5
                         save_player_profile(pid, profile)
                         user = lobby["users"].get(pid)
-                        await safe_send(ctx, f"🔧 **Mechanical Failure!** `{user.name}` has DNF'd! (+5 <:ZCoin:1379843253641285723> ZC)")
+                        await safe_send(ctx, f"🔧 **Mechanical Failure!** `{user.name}` has DNF'd! (+5 {zcoin_emoji} ZC)")
                     elif incident_type == "safety_car" and not lobby.get("safety_car_laps", 0):
                         lobby["safety_car_laps"] = random.randint(1, 3)
                         await safe_send(ctx, f"🚨 **Safety Car Deployed!** Slower laps for {lobby['safety_car_laps']} laps.")
@@ -440,7 +442,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 base_lap_time = 100.0
             weather = lobby["weather"]
             player_times = {}
-            for pid in lobby["position_order"]:
+            for pid in lobby["position_order"]:  # Changed from lobby["players"]
                 pdata = lobby["player_data"].get(pid)
                 if not pdata or pdata.get("dnf", False):
                     logger.debug(f"⏖ Skipping DNF player {pid}")
@@ -457,16 +459,16 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 just_pitted = False
                 pit_penalty = 0
                 last_pit_lap = pdata.get("last_pit_lap", -2)
-                if strategy == "Pit Stop" and last_pit_lap != current_lap:
+                if last_pit_lap == current_lap:
                     pit_penalty = 20.0
-                    pdata["last_pit_lap"] = current_lap
-                    logger.info(f"🛞 PIT STOP TRIGGERED for {pid} on lap {current_lap}")
+                    logger.info(f"🛞 PIT STOP TRIGGERED for {pid} on lap {current_lap} (P{lobby['position_order'].index(pid)+1})")
                     logger.debug(f"Before reset: Fuel={pdata.get('fuel')}, Tyre condition={pdata.get('tyre_condition')}")
                     pdata["fuel"] = 100.0
                     pdata["tyre_condition"] = 100.0
+                    pdata["strategy"] = "Balanced"
                     logger.debug(f"After reset: Fuel={pdata['fuel']}, Tyre condition={pdata['tyre_condition']}")
                     just_pitted = True
-                if lobby["position_order"].index(pid) == 0:  # P1
+                if lobby["position_order"].index(pid) == 0:  # Debug for P1
                     logger.debug(f"P1 {pid}: last_pit_lap={last_pit_lap}, pit_penalty={pit_penalty}, strategy={strategy}")
                 if not just_pitted:
                     fuel_usage = {"Push": 6.0, "Balanced": 4.0, "Save": 2.0}.get(strategy, 4.0)
@@ -554,7 +556,6 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     ("🌬️ Windy", "Intermediate"): 1.2
                 }.get((weather, tyre), 1.0)
                 tyre_wear_penalty = 1.0 + ((100.0 - pdata["tyre_condition"]) / 100.0) * 0.1
-                fuel_penalty = 1.0 + ((100.0 - pdata["fuel"]) / 100.0) * 0.05
                 skill_rating = pdata.get("skill_rating", 50)
                 driver_variance = random.uniform(0.98, 1.02) * (1 - (skill_rating - 50) / 1000)  # Higher skill → faster
                 lap_time = (base_lap_time * strat_factor[strategy] * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
@@ -658,7 +659,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             pos_display = podium_emojis.get(pos, f"{pos}.")
             embed.add_field(
                 name=f"P{pos} {pos_display}",
-                value=f"{user.name} — `{time_display}` — {points} pts — +{zcoins} <:ZCoin:1379843253641285723> ZC",
+                value=f"{user.name} — `{time_display}` — {points} pts — +{zcoins} {zcoin_emoji} ZC",
                 inline=True
             )
             profile = get_player_profile(pid)
@@ -1470,7 +1471,7 @@ async def coins(ctx):
     profile = get_player_profile(user_id)
     embed = discord.Embed(
         title=f"🪙 {ctx.author.name}'s ZCoins",
-        description=f"**ZCoins**: {profile['ZCoins']} <:ZCoin:1379843253641285723> ZC",
+        description=f"**ZCoins**: {profile['ZCoins']} {zcoin_emoji} ZC",
         color=discord.Color.gold()
     )
     embed.set_footer(text="Earn more by racing! Shop and upgrades coming soon!")
@@ -1496,7 +1497,7 @@ async def daily(ctx):
     save_player_profile(user_id, profile)
     embed = discord.Embed(
         title="🎉 Daily Reward Claimed!",
-        description=f"You received **50 <:ZCoin:1379843253641285723> ZC**! Check your balance with `!coins`.",
+        description=f"You received **50 {zcoin_emoji} ZC**! Check your balance with `!coins`.",
         color=discord.Color.green()
     )
     embed.set_footer(text="Come back tomorrow for more!")
@@ -1520,7 +1521,7 @@ async def weekly(ctx):
     save_player_profile(user_id, profile)
     embed = discord.Embed(
         title="🏆 Weekly Reward Claimed!",
-        description=f"You received **200 <:ZCoin:1379843253641285723> ZC**! Check your balance with `!coins`.",
+        description=f"You received **200 {zcoin_emoji} ZC**! Check your balance with `!coins`.",
         color=discord.Color.green()
     )
     embed.set_footer(text="Come back next week for more!")
@@ -1544,9 +1545,10 @@ async def monthly(ctx):
     save_player_profile(user_id, profile)
     embed = discord.Embed(
         title="🌟 Monthly Reward Claimed!",
-        description=f"You received **500 <:ZCoin:1379843253641285723> ZC**! Check your balance with `!coins`.",
+        description=f"You received **500 {zcoin_emoji} ZC**! Check your balance with `!coins`.",
         color=discord.Color.green()
     )
     embed.set_footer(text="Come back next month for more!")
     await ctx.send(embed=embed)
+
 
