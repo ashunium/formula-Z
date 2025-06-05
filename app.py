@@ -393,7 +393,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 await safe_send(ctx, "\n".join(weather_updates))
             if current_lap > total_laps:
                 break            
-            incident_chance = 0.05  # 5% per lap
+            incident_chance = 0.50  # 5% per lap
             if random.random() < incident_chance and not lobby.get("safety_car_laps", 0) and lobby.get("status", "racing") == "racing":
                 # Replace incident block in race_loop (lines ~30-45)
                 for pid in lobby["players"]:
