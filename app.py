@@ -788,9 +788,9 @@ def generate_race_status_embed(lobby):
         else:
             team_name = user.name  # Use player name in solo mode
         if strategy == "Pit Stop" and pdata.get("last_pit_lap", 0) != current_lap:
-            driver_line = f"**P{pos}** `{user.name}` ({team_name}) • 🛞 Pitting..."
+            driver_line = f"**P{pos}** `{user.name}` • 🛞 Pitting..."
         else:
-            driver_line = f"**P{pos}** `{user.name}` ({team_name}) • {tyre_display} • {strat_display} {strategy} • `{gap}`"
+            driver_line = f"**P{pos}** `{user.name}` • {tyre_display} • {strat_display} {strategy} • `{gap}`"
         embed.add_field(name="\u200b", value=driver_line, inline=False)
     dnf_players = [pid for pid, pdata in player_data.items() if pdata.get("dnf", False)]
     if dnf_players:
