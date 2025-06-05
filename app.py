@@ -85,6 +85,10 @@ def get_player_profile(user_id):
     save_career_stats()
     return career_stats[user_id]
 
+def save_player_profile(user_id, profile):
+    career_stats[user_id] = profile
+    save_career_stats()
+
 def save_career_stats():
     try:
         with open("career_stats.json", "w") as f:
@@ -313,7 +317,8 @@ async def start(ctx):
                 "last_sent_lap": 0,
                 "last_sent_fuel": 100.0,
                 "last_sent_tyre": 100.0,
-                "last_position": "?"
+                "last_position": "?",
+                "skill_rating": get_player_profile(pid)["skill_rating"]
             }
             view = StrategyPanelView(pid, channel_id)
             position = lobby["position_order"].index(pid) + 1
@@ -389,13 +394,13 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             incident_chance = 0.05  # 5% per lap
             if random.random() < incident_chance and not lobby.get("safety_car_laps", 0) and lobby.get("status", "racing") == "racing":
                 # Replace incident block in race_loop (lines ~30-45)
-            for pid in lobby["players"]:
-                if lobby.get("safety_car_laps", 0) or lobby.get("status", "racing") != "racing":
-                    continue  # Skip incidents during Safety Car or non-racing status
-                strategy = lobby["player_data"][pid].get("strategy", "Balanced")
-                incident_chance = 0.10 if strategy == "Push" else 0.05  # Higher for Push
-                if random.random() < incident_chance:
-                    incident_type = random.choices(
+                for pid in lobby["players"]:
+                    if lobby.get("safety_car_laps", 0) or lobby.get("status", "racing") != "racing":
+                        continue  # Skip incidents during Safety Car or non-racing status
+                    strategy = lobby["player_data"][pid].get("strategy", "Balanced")
+                    incident_chance = 0.10 if strategy == "Push" else 0.05  # Higher for Push
+                    if random.random() < incident_chance:
+                        incident_type = random.choices(
                         ["collision", "mechanical", "safety_car", "red_flag"],
                         weights=[0.5, 0.3, 0.15, 0.05] if strategy == "Push" else [0.4, 0.3, 0.2, 0.1]
                     )[0]
@@ -435,7 +440,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 base_lap_time = 100.0
             weather = lobby["weather"]
             player_times = {}
-            for pid in lobby["players"]:
+            for pid in lobby["position_order"]:
                 pdata = lobby["player_data"].get(pid)
                 if not pdata or pdata.get("dnf", False):
                     logger.debug(f"⏖ Skipping DNF player {pid}")
@@ -461,6 +466,8 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     pdata["tyre_condition"] = 100.0
                     logger.debug(f"After reset: Fuel={pdata['fuel']}, Tyre condition={pdata['tyre_condition']}")
                     just_pitted = True
+                if lobby["position_order"].index(pid) == 0:  # P1
+                    logger.debug(f"P1 {pid}: last_pit_lap={last_pit_lap}, pit_penalty={pit_penalty}, strategy={strategy}")
                 if not just_pitted:
                     fuel_usage = {"Push": 6.0, "Balanced": 4.0, "Save": 2.0}.get(strategy, 4.0)
                     base_wear = {"Push": 8.0, "Balanced": 5.0, "Save": 3.0}.get(strategy, 5.0)
@@ -503,12 +510,12 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         logger.warning(f"User {pid} not found in lobby during DNF")
 
                 if lobby.get("safety_car_laps", 0) > 0:
-                    strat_factor = {k: v * 1.2 for k, v in {
-                        "Push": 0.95,
-                        "Balanced": 1.0,
-                        "Save": 1.05,
-                        "Pit Stop": 1.15
-                    }.items()}  # Slow all strategies
+                    strat_factor = {
+                        "Push": 0.95 * 1.2,
+                        "Balanced": 1.0 * 1.2,
+                        "Save": 1.05 * 1.2,
+                        "Pit Stop": 1.15 * 1.2
+                    }  # Slow all strategies
                     lobby["safety_car_laps"] -= 1
                     if lobby["safety_car_laps"] == 0:
                         await safe_send(ctx, "🏁 **Safety Car In!** Normal racing resumes.")
@@ -550,7 +557,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 fuel_penalty = 1.0 + ((100.0 - pdata["fuel"]) / 100.0) * 0.05
                 skill_rating = pdata.get("skill_rating", 50)
                 driver_variance = random.uniform(0.98, 1.02) * (1 - (skill_rating - 50) / 1000)  # Higher skill → faster
-                lap_time = (base_lap_time * strat_factor * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
+                lap_time = (base_lap_time * strat_factor[strategy] * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
                 pdata["lap_times"].append(lap_time)
                 pdata["total_time"] += lap_time
                 player_times[pid] = pdata["total_time"]
@@ -677,7 +684,10 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             team_points = {}
             for team_idx, team in enumerate(lobby["teams"]):
                 team_points[team_idx] = sum(F1_POINTS.get(final_order.index(pid) + 1, 0) for pid in team if pid in final_order)
-            team_scores = [f"Team {idx + 1} — {points} pts" for idx, points in sorted(team_points.items(), key=lambda x: x[1], reverse=True)]
+            team_scores = [
+                f"{lobby.get('team_names', {}).get(idx + 1, f'Team {idx + 1}')} — {points} pts"
+                for idx, points in sorted(team_points.items(), key=lambda x: x[1], reverse=True)
+            ]
             embed.add_field(
                 name="🤝 Team Scores",
                 value="\n".join(team_scores) if team_scores else "No team scores.",
@@ -766,8 +776,15 @@ def generate_race_status_embed(lobby):
             prev_time = player_data.get(prev_pid, {}).get("total_time", 0.0)
             time_gap = total_time - prev_time
             gap = f"+{time_gap:.3f}s"
-        team_number = pos // 2 + 1
-        team_name = lobby.get("team_names", {}).get(team_number, f"Team {team_number}")
+        # Determine team name based on actual team assignment
+        if lobby["mode"] == "duo":
+            team_name = "Unknown Team"
+            for i, team in enumerate(lobby.get("teams", []), 1):
+                if pid in team:
+                    team_name = lobby.get("team_names", {}).get(i, f"Team {i}")
+                    break
+        else:
+            team_name = user.name  # Use player name in solo mode
         if strategy == "Pit Stop" and pdata.get("last_pit_lap", 0) != current_lap:
             driver_line = f"**P{pos}** `{user.name}` ({team_name}) • 🛞 Pitting..."
         else:
@@ -991,11 +1008,40 @@ async def lobby(ctx):
         description=f"**Weather:** {weather} • **Mode:** {lobby_found['mode'].capitalize()}",
         color=discord.Color.blue()
     )
+    
     if lobby_found["mode"] == "duo":
         team_display = []
-for i, team in enumerate(lobby_found["teams"], 1):
-    team_names = []
-    for pid in team:
+        for i, team in enumerate(lobby_found["teams"], 1):
+            team_names = []
+            for pid in team:
+                user = lobby_found["users"].get(pid)
+                if not user:
+                    try:
+                        user = await bot.fetch_user(pid)
+                        lobby_found["users"][pid] = user
+                    except (discord.NotFound, discord.HTTPException):
+                        logger.warning(f"Failed to fetch user {pid} for lobby display")
+                        team_names.append(f"Unknown ({pid})")
+                        continue
+                team_names.append(user.name)
+            if team_names:
+                team_name = lobby_found.get("team_names", {}).get(i, f"Team {i}")
+                team_display.append(f"**{team_name}**: {', '.join(team_names)}")
+        if team_display:
+            embed.add_field(
+                name="🤝 Teams in Lobby",
+                value="\n".join(team_display),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="🤝 Teams in Lobby",
+                value="No teams assigned yet.",
+                inline=False
+            )
+    
+    player_names = []
+    for pid in lobby_found["players"]:  # Use players list directly, not position_order
         user = lobby_found["users"].get(pid)
         if not user:
             try:
@@ -1003,37 +1049,15 @@ for i, team in enumerate(lobby_found["teams"], 1):
                 lobby_found["users"][pid] = user
             except (discord.NotFound, discord.HTTPException):
                 logger.warning(f"Failed to fetch user {pid} for lobby display")
+                player_names.append(f"Unknown ({pid})")
                 continue
-        team_names.append(user.name)
-    if team_names:
-        team_name = lobby_found.get("team_names", {}).get(i, f"Team {i}")
-        team_display.append(f"**{team_name}**: {team_names[0]} & {team_names[1]}")
-        embed.add_field(
-            name="🤝 Teams in Lobby",
-            value="\n".join(team_display) if team_display else "No teams assigned yet.",
-            inline=False
-        )
-    else:
-        player_names = []
-        player_list = lobby_found.get("position_order", lobby_found["players"])
-        for pid in player_list:
-            user = lobby_found["users"].get(pid)
-            if not user:
-                try:
-                    user = await bot.fetch_user(pid)
-                    lobby_found["users"][pid] = user
-                except (discord.NotFound, discord.HTTPException):
-                    logger.warning(f"Failed to fetch user {pid} for lobby display")
-                    continue
-            if "position_order" in lobby_found:
-                player_names.append(f"{user.name} - P{lobby_found['position_order'].index(pid)+1}")
-            else:
-                player_names.append(f"{user.name}")
-        embed.add_field(
-            name="🏁 Players in Lobby",
-            value="\n".join(player_names) if player_names else "No players yet.",
-            inline=False
-        )
+        player_names.append(user.name)
+    embed.add_field(
+        name="🏁 Players in Lobby",
+        value="\n".join(player_names) if player_names else "No players yet.",
+        inline=False
+    )
+    
     embed.add_field(name="🚦 Race Status", value="**Waiting for all players to ready up!**", inline=False)
     await ctx.send(embed=embed)
 
@@ -1082,7 +1106,7 @@ async def cm(ctx, mode: str = None):
                         team_names.append(f"Unknown ({pid})")
                         continue
                 team_names.append(user.name)
-            team_display.append(f"**Team {i}**: {team_names[0]} & {team_names[1]}")
+            team_display.append(f"**Team {i}**: {', '.join(team_names)}")
         embed = discord.Embed(
             title="🤝 Duo Mode Activated",
             description="Players have been randomly paired into teams!",
@@ -1445,7 +1469,7 @@ async def coins(ctx):
     user_id = ctx.author.id
     profile = get_player_profile(user_id)
     embed = discord.Embed(
-        title=f"💸 {ctx.author.name}'s ZCoins",
+        title=f"🪙 {ctx.author.name}'s ZCoins",
         description=f"**ZCoins**: {profile['ZCoins']} <:ZCoin:1379843253641285723> ZC",
         color=discord.Color.gold()
     )
@@ -1525,3 +1549,4 @@ async def monthly(ctx):
     )
     embed.set_footer(text="Come back next month for more!")
     await ctx.send(embed=embed)
+
