@@ -556,6 +556,7 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     ("🌬️ Windy", "Intermediate"): 1.2
                 }.get((weather, tyre), 1.0)
                 tyre_wear_penalty = 1.0 + ((100.0 - pdata["tyre_condition"]) / 100.0) * 0.1
+                fuel_penalty = 1.0 + ((100.0 - pdata["fuel"]) / 100.0) * 0.05
                 skill_rating = pdata.get("skill_rating", 50)
                 driver_variance = random.uniform(0.98, 1.02) * (1 - (skill_rating - 50) / 1000)  # Higher skill → faster
                 lap_time = (base_lap_time * strat_factor[strategy] * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
