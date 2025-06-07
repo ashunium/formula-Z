@@ -1,0 +1,330 @@
+async def race_loop(ctx, channel_id, status_msg, total_laps):
+    try:
+        lap_delay = 5.0
+        while channel_id in lobbies:
+            lap_start_time = time.time()
+            await handle_safety_car(ctx, lobby, current_lap)
+            if channel_id not in lobbies:
+                logger.warning(f"Lobby {channel_id} removed during race_loop")
+                return
+            lobby = lobbies.get(channel_id)
+            if not lobby:
+                logger.error(f"Lobby {channel_id} missing during race_loop")
+                return
+            current_lap = lobby.get("current_lap", 1)
+            window = lobby.get("weather_window", {})
+            start = window.get("start")
+            end = window.get("end")
+            new_weather = window.get("new_weather")
+            initial_weather = lobby.get("initial_weather", lobby["weather"])
+            weather_updates = []
+            if start is not None and end is not None and current_lap == start and lobby["weather"] != new_weather:
+                lobby["weather"] = new_weather
+                weather_updates.append(f"Weather has changed to {new_weather} on Lap {current_lap}!")
+            elif end is not None and current_lap == end + 1 and lobby["weather"] != initial_weather:
+                lobby["weather"] = initial_weather
+                weather_updates.append(f"Weather has reverted to {initial_weather} on Lap {current_lap}!")
+            if weather_updates:
+                await safe_send(ctx, "\n".join(weather_updates))
+            if current_lap > total_laps:
+                break
+            track = lobby.get("track")
+            if track in TRACKS_INFO:
+                base_lap_time = TRACKS_INFO[track]["base_lap_time"]
+            else:
+                logger.error(f"Invalid track {track} in lobby {channel_id}")
+                base_lap_time = 100.0
+            weather = lobby["weather"]
+            player_times = {}
+            for pid in lobby["players"]:
+                pdata = lobby["player_data"].get(pid)
+                if not pdata or pdata.get("dnf", False):
+                    logger.debug(f"⏖ Skipping DNF player {pid}")
+                    continue
+                if pid not in lobby["users"]:
+                    try:
+                        user = await bot.fetch_user(pid)
+                        lobby["users"][pid] = user
+                    except (discord.NotFound, discord.HTTPException):
+                        logger.warning(f"Failed to fetch user {pid}")
+                        continue
+                strategy = pdata.get("strategy", "Balanced")
+                tyre = pdata.get("tyre", "Medium")
+                just_pitted = False
+                pit_penalty = 0
+                last_pit_lap = pdata.get("last_pit_lap", -2)
+                if strategy == "Pit Stop" and last_pit_lap != current_lap:
+                    pit_penalty = 20.0
+                    pdata["last_pit_lap"] = current_lap
+                    just_pitted = True
+                    logger.info(f"🛞 PIT STOP TRIGGERED for {pid} (User: {lobby['users'].get(pid, {'name': 'Unknown'}).name}) on lap {current_lap}, Penalty: {pit_penalty}s")
+                    logger.debug(f"Before pit reset: Fuel={pdata.get('fuel')}, Tyre condition={pdata.get('tyre_condition')}")
+                    pdata["fuel"] = 100.0
+                    pdata["tyre_condition"] = 100.0
+                    logger.debug(f"After pit reset: Fuel={pdata['fuel']}, Tyre condition={pdata['tyre_condition']}, Strategy reset to Balanced")
+                    pdata["strategy"] = "Balanced"
+                if not just_pitted and not lobby.get("safety_car_active", False):
+                    base_fuel_usage = {"Push": 6.0, "Balanced": 4.0, "Save": 2.0}.get(strategy, 4.0)
+                    base_wear = {"Push": 8.0, "Balanced": 5.0, "Save": 3.0}.get(strategy, 5.0)
+                    speed_multiplier, accel_multiplier, variance_min, variance_max, tyre_wear_multiplier, collision_risk, engine_risk, gearbox_risk = apply_track_conditions(lobby, pdata)
+                    base_lap_time *= speed_multiplier
+                    fuel_usage = base_fuel_usage * accel_multiplier
+                    tyre_type_wear = {
+                        "Soft": 1.3,
+                        "Medium": 1.0,
+                        "Hard": 0.7,
+                        "Intermediate": 1.1,
+                        "Wet": 0.9
+                    }.get(tyre, 1.0)
+                    tyre_wear = base_wear * tyre_type_wear * tyre_wear_multiplier
+                    if weather == "🌦️ Light Rain":
+                        if tyre == "Intermediate":
+                            tyre_wear *= 0.85
+                        elif tyre == "Wet":
+                            tyre_wear *= 1.15
+                    elif weather == "🌧️ Heavy Rain":
+                        if tyre == "Intermediate":
+                            tyre_wear *= 1.10
+                        elif tyre == "Wet":
+                            tyre_wear *= 0.75
+                    else:
+                        if tyre == "Wet":
+                            tyre_wear *= 1.6
+                        elif tyre == "Intermediate":
+                            tyre_wear *= 1.3
+                    logger.debug(f"🔧 Degradation - Fuel Usage: {fuel_usage}, Tyre Wear: {tyre_wear}, Weather: {weather}, Track Conditions: Speed={speed_multiplier}, Accel={accel_multiplier}, Corners={tyre_wear_multiplier}, Crash Risks: Collision={collision_risk}, Engine={engine_risk}, Gearbox={gearbox_risk}")
+                    prev_fuel = pdata.get("fuel", 100.0)
+                    prev_tyre = pdata.get("tyre_condition", 100.0)
+                    pdata["fuel"] = max(prev_fuel - fuel_usage, 0.0)
+                    pdata["tyre_condition"] = max(prev_tyre - tyre_wear, 0.0)
+            # Check for crashes
+                    crash_types = [
+                        ("Collision", collision_risk),
+                        ("Engine Failure", engine_risk),
+                        ("Gearbox Issue", gearbox_risk)
+                    ]
+                    for crash_type, risk in crash_types:
+                        if risk > 0 and random.random() < risk and not pdata.get("dnf", False):
+                            pdata["dnf"] = True
+                            pdata["dnf_reason"] = crash_type
+                            logger.info(f"💀 DNF: {pid} DNFed on lap {current_lap}: {crash_type}")
+                            embed = discord.Embed(
+                                title="🏎️🏁 Crash Alert!",
+                                description=f"✦ `{lobby['users'][pid].name}` DNFed: {crash_type}! ✦",
+                                color=discord.Color.red()
+                            )
+                            embed.set_footer(text="🏆 Check your DM strategy panel!")
+                            await safe_send(ctx, embed=embed)
+                    # Notify player via DM
+                            if pid in lobby["users"]:
+                                try:
+                                    dm_embed = discord.Embed(
+                                        title="🏎️🏁 Your Race Ended!",
+                                        description=f"✦ Your car suffered a {crash_type.lower()} on Lap {current_lap}. ✦",
+                                        color=discord.Color.red()
+                                    )
+                                    await lobby["users"][pid].send(embed=dm_embed)
+                                except (discord.Forbidden, discord.HTTPException):
+                                    logger.warning(f"Failed to send crash DM to {pid}")
+                if pdata.get("fuel", 0.0) <= 0 or pdata.get("tyre_condition", 0.0) <= 0:
+                    pdata["dnf"] = True
+                    pdata["dnf_reason"] = "Out of fuel" if pdata.get("fuel", 0.0) <= 0 else "Tyres worn out"
+                    logger.info(f"💀 DNF: {pid} DNFed on lap {current_lap}: {pdata['dnf_reason']}")
+                    embed = discord.Embed(
+                        title="🏎️🏁 DNF Alert!",
+                        description=f"✦ `{lobby['users'][pid].name}` DNFed: {pdata['dnf_reason']} on Lap {current_lap}! ✦",
+                        color=discord.Color.red()
+                    )
+                    await safe_send(ctx, embed=embed)
+                strat_factor = {
+                    "Push": 0.95,
+                    "Balanced": 1.0,
+                    "Save": 1.05,
+                   "Pit Stop": 1.15
+                }.get(strategy, 1.0)
+                weather_penalty = {
+                    ("☀️ Sunny", "Soft"): 1.0,
+                    ("☀️ Sunny", "Medium"): 1.02,
+                    ("☀️ Sunny", "Hard"): 1.04,
+                    ("☀️ Sunny", "Wet"): 1.4,
+                    ("☀️ Sunny", "Intermediate"): 1.3,
+                    ("🌦️ Light Rain", "Soft"): 1.35,
+                    ("🌦️ Light Rain", "Medium"): 1.25,
+                    ("🌦️ Light Rain", "Hard"): 1.3,
+                    ("🌦️ Light Rain", "Intermediate"): 1.0,
+                    ("🌦️ Light Rain", "Wet"): 1.1,
+                    ("🌧️ Heavy Rain", "Soft"): 1.5,
+                    ("🌧️ Heavy Rain", "Medium"): 1.4,
+                    ("🌧️ Heavy Rain", "Hard"): 1.45,
+                    ("🌧️ Heavy Rain", "Intermediate"): 1.15,
+                    ("🌧️ Heavy Rain", "Wet"): 1.0,
+                    ("☁️ Cloudy", "Soft"): 1.0,
+                    ("☁️ Cloudy", "Medium"): 1.0,
+                    ("☁️ Cloudy", "Hard"): 1.05,
+                    ("☁️ Cloudy", "Wet"): 1.3,
+                    ("☁️ Cloudy", "Intermediate"): 1.2,
+                    ("🌬️ Windy", "Soft"): 1.1,
+                    ("🌬️ Windy", "Medium"): 1.05,
+                    ("🌬️ Windy", "Hard"): 1.0,
+                    ("🌬️ Windy", "Wet"): 1.35,
+                    ("🌬️ Windy", "Intermediate"): 1.2
+                }.get((weather, tyre), 1.0)
+                tyre_wear_penalty = 1.0 + ((100.0 - pdata["tyre_condition"]) / 100.0) * 0.1
+                fuel_penalty = 1.0
+                driver_variance = 1.0 if lobby.get("safety_car_active", False) else random.uniform(variance_min, variance_max)
+                lap_time = (base_lap_time * strat_factor * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
+                if lobby.get("safety_car_active", False):
+                    lap_time *= 1.2  # 20% slower under safety car
+                pdata["lap_times"].append(lap_time)
+                prev_total_time = pdata["total_time"]
+                pdata["total_time"] += lap_time
+                player_times[pid] = pdata["total_time"]
+                logger.debug(f"🏎 {pid} (User: {lobby['users'].get(pid, {'name': 'Unknown'}).name}) - Pos: {lobby['position_order'].index(pid)+1 if pid in lobby['position_order'] else 'N/A'}, Strat: {strategy}, Lap: {lap_time:.2f}s, Pit Penalty: {pit_penalty}s, Total: {pdata['total_time']:.2f}s (Prev: {prev_total_time:.2f}s), Fuel: {pdata['fuel']:.1f}%, Tyre: {pdata['tyre_condition']:.1f}%")
+            valid_players = [pid for pid in lobby["players"] if not lobby["player_data"].get(pid, {}).get("dnf", False)]
+            lobby["position_order"] = sorted(valid_players, key=lambda pid: lobby["player_data"].get(pid, {}).get("total_time", float('inf')))
+            # Log position order after update
+            logger.info(f"Position order after lap {current_lap}: {[lobby['users'].get(pid, {'name': f'Unknown ({pid})'}).name + f' ({lobby['player_data'][pid]['total_time']:.2f}s)' for pid in lobby['position_order']]}")
+            embed = generate_race_status_embed(lobby)
+            try:
+                msg = await ctx.channel.fetch_message(lobby["status_msg_id"])
+                await msg.edit(embed=embed)
+            except discord.NotFound:
+                logger.warning("Race status message not found, recreating...")
+                new_msg = await ctx.send(embed=embed)
+                lobby["status_msg_id"] = new_msg.id
+            except discord.HTTPException as e:
+                logger.error(f"HTTP error updating status message: {e}")
+                if e.status != 429:
+                    raise
+            lobby["current_lap"] += 1
+            for pid in lobby["players"]:
+                user = lobby["users"].get(pid)
+                pdata = lobby["player_data"].get(pid)
+                if not user or not pdata:
+                    logger.warning(f"Skipping DM update for pid {pid}: user or data missing")
+                    continue
+                if pdata.get("dnf", False):
+                    position = "DNF"
+                else:
+                    try:
+                        position = lobby["position_order"].index(pid) + 1
+                    except ValueError:
+                        position = "?"
+                total = len(lobby["players"])
+                fuel = round(pdata.get("fuel", 0.0), 1)
+                tyre_cond = round(pdata.get("tyre_condition", 0.0), 1)
+                weather_emoji = lobby["weather"]
+                safety_car_status = "🚨 Active" if lobby.get("safety_car_active", False) else "Inactive"
+                last_sent_lap = pdata.get("last_sent_lap", 0)
+                if (current_lap != last_sent_lap or
+                    abs(pdata["fuel"] - pdata.get("last_sent_fuel", 100.0)) > 5 or
+                    abs(pdata["tyre_condition"] - pdata.get("last_sent_tyre", 100.0)) > 5 or
+                    position != pdata.get("last_position", "?")):
+                    embed = discord.Embed(
+                        title="📊 Strategy Panel (Live)",
+                        description=(
+                            f"📍 You are currently **P{position}** out of **{total}**.\n"
+                            f"🏁 Lap **{current_lap}/{total_laps}**\n"
+                            f"Weather: **{weather_emoji}**\n"
+                            f"🚨 Safety Car: **{safety_car_status}**\n"
+                            f"⛽ Fuel: **{fuel}%**\n"
+                            f"🛞 Tyre Condition: **{tyre_cond}%**"
+                        ),
+                        color=discord.Color.orange()
+                    )
+                    embed.add_field(
+                        name="Strategies",
+                        value="⚡ Push\n⚖️ Balanced\n🛟 Save\n🛞 Pit Stop",
+                        inline=False
+                    )
+                    embed.set_footer(text="Use this panel during the race to update your strategy.")
+                    dm_msg = pdata.get("dm_msg")
+                    if dm_msg:
+                        try:
+                            await dm_msg.edit(embed=embed)
+                            pdata["last_sent_fuel"] = pdata["fuel"]
+                            pdata["last_sent_tyre"] = pdata["tyre_condition"]
+                            pdata["last_position"] = position
+                            pdata["last_sent_lap"] = current_lap
+                            logger.debug(f"📨 Updated DM for {user.name} on lap {current_lap}")
+                        except (discord.HTTPException, discord.Forbidden) as e:
+                            logger.warning(f"Failed to update DM for pid {pid}: {e}")
+                            pdata["dm_msg"] = None
+            elapsed = time.time() - lap_start_time
+            await asyncio.sleep(max(0, lap_delay - elapsed))
+            logger.debug(f"🏁 Finished lap {lobby['current_lap'] - 1}: Actual time = {elapsed:.2f}s")
+        if channel_id not in lobbies:
+            return
+        # Final results logic remains unchanged
+        final_order = lobby["position_order"]
+        embed = discord.Embed(
+            title=f"🏆 {lobby['track']} Grand Prix — Results",
+            description=f"Weather: {lobby['weather']}",
+            color=discord.Color.green()
+        )
+        podium_emojis = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+        leader_time = lobby["player_data"][final_order[0]]["total_time"] if final_order else None
+        for pos, pid in enumerate(final_order, 1):
+            user = lobby["users"].get(pid)
+            if not user:
+                continue
+            total_time = lobby["player_data"][pid]["total_time"]
+            if pos == 1 or leader_time is None:
+                time_display = format_race_time(total_time)
+            else:
+                gap = total_time - leader_time
+                time_display = f"+{gap:.3f}s"
+            points = F1_POINTS.get(pos, 0)
+            pos_display = podium_emojis.get(pos, f"{pos}.")
+            embed.add_field(
+                name=f"P{pos} {pos_display}",
+                value=f"{user.name} — `{time_display}` — {points} pts",
+                inline=True
+            )
+            profile = get_player_profile(pid)
+            profile["points"] += points
+        dnf_players = [pid for pid, pdata in lobby["player_data"].items() if pdata.get("dnf", False)]
+        if dnf_players:
+            dnf_names = [f"{lobby['users'].get(pid, {'name': f'Unknown ({pid})'}).name} — {lobby['player_data'][pid]['dnf_reason']}" for pid in dnf_players if pid in lobby["users"]]
+            embed.add_field(
+                name="❌ DNFs",
+                value="\n".join(dnf_names) if dnf_names else "No DNFs recorded.",
+                inline=False
+            )
+        if lobby["mode"] == "duo":
+            team_points = {}
+            for team_idx, team in enumerate(lobby["teams"]):
+                team_name = lobby["team_names"].get(team_idx, f"Team {team_idx + 1}")
+                team_points[team_name] = sum(F1_POINTS.get(final_order.index(pid) + 1, 0) for pid in team if pid in final_order)
+            team_scores = [f"{name} — {points} pts" for name, points in sorted(team_points.items(), key=lambda x: x[1], reverse=True)]
+            embed.add_field(
+                name="🤝 Team Scores",
+                value="\n".join(team_scores) if team_scores else "No team scores.",
+                inline=False
+            )
+        for pid in lobby["players"]:
+            pdata = lobby["player_data"].get(pid, {})
+            profile = get_player_profile(pid)
+            profile["races"] += 1
+            if not pdata.get("dnf", False):
+                profile["total_time"] += pdata.get("total_time", 0.0)
+                pos = final_order.index(pid) + 1 if pid in final_order else None
+                if pos == 1:
+                    profile["wins"] += 1
+                if pos and pos <= 3:
+                    profile["podiums"] += 1
+            if pdata.get("lap_times", []):
+                fastest_lap_in_race = min(pdata["lap_times"])
+                if not profile["fastest_lap"] or fastest_lap_in_race < profile["fastest_lap"]:
+                    profile["fastest_lap"] = fastest_lap_in_race
+                    logger.info(f"🏅 New fastest lap for {pid}: {fastest_lap_in_race:.2f}s")
+            if pdata.get("dnf", False):
+                profile["dnfs"] += 1
+        save_career_stats()
+        await safe_send(ctx, embed=embed)
+        del lobbies[channel_id]
+    except Exception as e:
+        logger.error(f"🏃‍♂️ Race loop failed: {e}")
+        await safe_send(ctx, "❌ The race crashed! Please try creating a new lobby with `!create`.")
+        if channel_id in lobbies:
+            del lobbies[channel_id]
