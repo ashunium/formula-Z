@@ -8,6 +8,9 @@ import atexit
 import os
 import time
 import logging
+import datetime
+import os
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("F1Bot")
@@ -16,7 +19,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="-", intents=intents)
 bot.remove_command("help")
 
 TRACKS_INFO = {
@@ -891,7 +894,12 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             valid_players = [pid for pid in lobby["players"] if not lobby["player_data"].get(pid, {}).get("dnf", False)]
             lobby["position_order"] = sorted(valid_players, key=lambda pid: lobby["player_data"].get(pid, {}).get("total_time", float('inf')))
             # Log position order after update
-            logger.info(f"Position order after lap {current_lap}: {[lobby['users'].get(pid, {'name': f'Unknown ({pid})'}).name + f' ({lobby['player_data'][pid]['total_time']:.2f}s)' for pid in lobby['position_order']]}")
+            position_info = []
+            for pid in lobby['position_order']:
+               player_data = lobby['player_data'][pid]
+               user = lobby['users'].get(pid, {'name': f'Unknown ({pid})'})
+               position_info.append(f"{user.name} ({player_data['total_time']:.2f}s)")
+            logger.info(f"Position order after lap {current_lap}: {position_info}")
             embed = generate_race_status_embed(lobby)
             try:
                 msg = await ctx.channel.fetch_message(lobby["status_msg_id"])
@@ -1057,6 +1065,27 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 profile["dnfs"] += 1
         save_career_stats()
         await safe_send(ctx, embed=embed)
+        if channel_id in lobbies:
+            lobby = lobbies[channel_id]
+            log_race(lobby["mode"], channel_id)
+            
+            # Log race details to the specified channel if configured
+            race_log_channel_id = 1381832404490256444  # Replace with your channel ID
+            if race_log_channel_id:
+                try:
+                    channel = bot.get_channel(race_log_channel_id)
+                    if channel:
+                        embed = discord.Embed(
+                            title="🏁 Race Completed",
+                            description=f"Race #{len(load_logs()['race_history'])} logged",
+                            color=discord.Color.green()
+                        )
+                        embed.add_field(name="Track", value=lobby["track"], inline=True)
+                        embed.add_field(name="Mode", value=lobby["mode"].capitalize(), inline=True)
+                        embed.add_field(name="Players", value=str(len(lobby["players"])), inline=True)
+                        await channel.send(embed=embed)
+                except Exception as e:
+                    logger.error(f"Failed to log race to channel: {e}")
         del lobbies[channel_id]
     except Exception as e:
         logger.error(f"🏃‍♂️ Race loop failed: {e}")
@@ -2263,6 +2292,247 @@ async def tm(ctx):
         color=discord.Color.green()
     )
     await ctx.send(embed=embed)
+
+# Initialize logging data structure
+if not os.path.exists('race_logs.json'):
+    with open('race_logs.json', 'w') as f:
+        json.dump({
+            "daily": {"races": 0, "solo": 0, "duo": 0, "date": str(datetime.date.today())},
+            "weekly": {"races": 0, "solo": 0, "duo": 0, "week": datetime.date.today().isocalendar()[1]},
+            "monthly": {"races": 0, "solo": 0, "duo": 0, "month": datetime.date.today().month},
+            "yearly": {"races": 0, "solo": 0, "duo": 0, "year": datetime.date.today().year},
+            "servers": {
+                "total": 0,
+                "weekly_new": 0,
+                "monthly_new": 0,
+                "yearly_new": 0,
+                "tracking_start": str(datetime.date.today())
+            },
+            "server_join_dates": {},
+            "race_history": []
+        }, f, indent=2)
+
+def load_logs():
+    try:
+        with open('race_logs.json', 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            "daily": {"races": 0, "solo": 0, "duo": 0, "date": str(datetime.date.today())},
+            "weekly": {"races": 0, "solo": 0, "duo": 0, "week": datetime.date.today().isocalendar()[1]},
+            "monthly": {"races": 0, "solo": 0, "duo": 0, "month": datetime.date.today().month},
+            "yearly": {"races": 0, "solo": 0, "duo": 0, "year": datetime.date.today().year},
+            "servers": {
+                "total": 0,
+                "weekly_new": 0,
+                "monthly_new": 0,
+                "yearly_new": 0,
+                "tracking_start": str(datetime.date.today())
+            },
+            "server_join_dates": {},
+            "race_history": []
+        }
+
+def save_logs(logs):
+    try:
+        with open('race_logs.json', 'w') as f:
+            json.dump(logs, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save logs: {e}")
+
+def update_time_periods(logs):
+    today = datetime.date.today()
+    
+    # Daily check
+    if logs["daily"]["date"] != str(today):
+        logs["daily"] = {"races": 0, "solo": 0, "duo": 0, "date": str(today)}
+    
+    # Weekly check
+    current_week = today.isocalendar()[1]
+    if logs["weekly"]["week"] != current_week:
+        logs["weekly"] = {"races": 0, "solo": 0, "duo": 0, "week": current_week}
+    
+    # Monthly check
+    current_month = today.month
+    if logs["monthly"]["month"] != current_month:
+        logs["monthly"] = {"races": 0, "solo": 0, "duo": 0, "month": current_month}
+    
+    # Yearly check
+    current_year = today.year
+    if logs["yearly"]["year"] != current_year:
+        logs["yearly"] = {"races": 0, "solo": 0, "duo": 0, "year": current_year}
+    
+    return logs
+
+@bot.event
+async def on_guild_join(guild):
+    logs = load_logs()
+    logs = update_time_periods(logs)
+    
+    # Update server counts
+    logs["servers"]["total"] = len(bot.guilds)
+    
+    # Track new server joins
+    today = datetime.date.today()
+    join_date = str(today)
+    logs["server_join_dates"][str(guild.id)] = join_date
+    
+    # Calculate new joins for time periods
+    weekly_new = 0
+    monthly_new = 0
+    yearly_new = 0
+    current_week = today.isocalendar()[1]
+    current_month = today.month
+    current_year = today.year
+    
+    for server_id, join_date_str in logs["server_join_dates"].items():
+        join_date = datetime.date.fromisoformat(join_date_str)
+        if (today - join_date).days <= 7:
+            weekly_new += 1
+        if join_date.month == current_month and join_date.year == current_year:
+            monthly_new += 1
+        if join_date.year == current_year:
+            yearly_new += 1
+    
+    logs["servers"]["weekly_new"] = weekly_new
+    logs["servers"]["monthly_new"] = monthly_new
+    logs["servers"]["yearly_new"] = yearly_new
+    
+    save_logs(logs)
+
+def log_race(mode, channel_id=None):
+    logs = load_logs()
+    logs = update_time_periods(logs)
+    
+    # Update race counts
+    logs["daily"]["races"] += 1
+    logs["weekly"]["races"] += 1
+    logs["monthly"]["races"] += 1
+    logs["yearly"]["races"] += 1
+    
+    # Update mode counts
+    if mode == "solo":
+        logs["daily"]["solo"] += 1
+        logs["weekly"]["solo"] += 1
+        logs["monthly"]["solo"] += 1
+        logs["yearly"]["solo"] += 1
+    else:  # duo
+        logs["daily"]["duo"] += 1
+        logs["weekly"]["duo"] += 1
+        logs["monthly"]["duo"] += 1
+        logs["yearly"]["duo"] += 1
+    
+    # Add to race history if channel_id is provided
+    if channel_id:
+        logs["race_history"].append({
+            "timestamp": str(datetime.datetime.now()),
+            "mode": mode,
+            "channel_id": channel_id
+        })
+        # Keep only the last 100 races in history
+        if len(logs["race_history"]) > 100:
+            logs["race_history"] = logs["race_history"][-100:]
+    
+    save_logs(logs)
+
+@bot.command()
+async def logs(ctx, time_period: str = None):
+    logs = load_logs()
+    
+    if not time_period:
+        # Show log options
+        embed = discord.Embed(
+            title="📊 Logging System",
+            description="Select a time period to view logs:",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Options", value="`!logs daily`\n`!logs weekly`\n`!logs monthly`\n`!logs yearly`", inline=False)
+        await ctx.send(embed=embed)
+        return
+    
+    time_period = time_period.lower()
+    valid_periods = ["daily", "weekly", "monthly", "yearly"]
+    
+    if time_period not in valid_periods:
+        await ctx.send("❌ Invalid time period. Use: daily, weekly, monthly, or yearly")
+        return
+    
+    data = logs[time_period]
+    servers = logs["servers"]
+    
+    embed = discord.Embed(
+        title=f"📊 {time_period.capitalize()} Logs",
+        color=discord.Color.green()
+    )
+    
+    embed.add_field(name="Races Completed", value=str(data["races"]), inline=True)
+    embed.add_field(name="Solo Races", value=str(data["solo"]), inline=True)
+    embed.add_field(name="Duo Races", value=str(data["duo"]), inline=True)
+    
+    if time_period == "daily":
+        embed.add_field(name="Date", value=data["date"], inline=False)
+    elif time_period == "weekly":
+        embed.add_field(name="Week Number", value=data["week"], inline=False)
+    elif time_period == "monthly":
+        embed.add_field(name="Month", value=data["month"], inline=False)
+    elif time_period == "yearly":
+        embed.add_field(name="Year", value=data["year"], inline=False)
+    
+    embed.add_field(name="Total Servers", value=str(servers["total"]), inline=True)
+    
+    if time_period == "weekly":
+        embed.add_field(name="New Servers This Week", value=str(servers["weekly_new"]), inline=True)
+    elif time_period == "monthly":
+        embed.add_field(name="New Servers This Month", value=str(servers["monthly_new"]), inline=True)
+    elif time_period == "yearly":
+        embed.add_field(name="New Servers This Year", value=str(servers["yearly_new"]), inline=True)
+    
+    await ctx.send(embed=embed)
+
+# Update on_ready to initialize server counts
+@bot.event
+async def on_ready():
+    logger.info("Starting bot initialization...")
+    load_career_stats()
+    migrate_to_car_parts()
+    
+    # Initialize server counts in logs
+    logs = load_logs()
+    logs["servers"]["total"] = len(bot.guilds)
+    
+    # Check for new servers that haven't been tracked yet
+    for guild in bot.guilds:
+        if str(guild.id) not in logs["server_join_dates"]:
+            logs["server_join_dates"][str(guild.id)] = str(datetime.date.today())
+    
+    # Recalculate new server counts
+    today = datetime.date.today()
+    weekly_new = 0
+    monthly_new = 0
+    yearly_new = 0
+    current_week = today.isocalendar()[1]
+    current_month = today.month
+    current_year = today.year
+    
+    for server_id, join_date_str in logs["server_join_dates"].items():
+        join_date = datetime.date.fromisoformat(join_date_str)
+        if (today - join_date).days <= 7:
+            weekly_new += 1
+        if join_date.month == current_month and join_date.year == current_year:
+            monthly_new += 1
+        if join_date.year == current_year:
+            yearly_new += 1
+    
+    logs["servers"]["weekly_new"] = weekly_new
+    logs["servers"]["monthly_new"] = monthly_new
+    logs["servers"]["yearly_new"] = yearly_new
+    
+    save_logs(logs)
+    
+    logger.info(f'🚀 {bot.user} has connected to Discord!')
+    logger.info(f"Career stats after load: {career_stats}")
+    # Start autosave task
+    bot.loop.create_task(autosave_career_stats())
 
 
 
