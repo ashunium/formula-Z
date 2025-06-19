@@ -11,6 +11,7 @@ import logging
 import datetime
 import os
 from collections import defaultdict
+import uuid
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("F1Bot")
@@ -19,7 +20,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="-", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
 TRACKS_INFO = {
@@ -61,7 +62,11 @@ AUTHORIZED_TM_USERS = [
     1323664472463642624,
     785052256428883990,
 ]
+AUTHORIZED_USERS = [
+    785052256428883990,
+]
 
+banned_users = {}
 lobbies = {}
 career_stats = {}
 default_player_profile = {
@@ -201,6 +206,28 @@ def load_career_stats():
             logger.error(f"❌ Failed to load backup: {e}, starting fresh")
             career_stats = {}
 
+def load_banned_users():
+    global banned_users
+    try:
+        if os.path.exists("banned_users.json"):
+            with open("banned_users.json", "r") as f:
+                banned_users = json.load(f)
+                logger.info(f"✅ Loaded banned_users.json (Entries: {len(banned_users)})")
+        else:
+            logger.info("ℹ️ banned_users.json not found, starting fresh")
+            banned_users = {}
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"⚠️ Error loading banned_users.json: {e}")
+        banned_users = {}
+
+def save_banned_users():
+    try:
+        with open("banned_users.json", "w") as f:
+            json.dump(banned_users, f, indent=2)
+        logger.info(f"💾 Saved banned_users.json")
+    except (IOError, OSError) as e:
+        logger.error(f"Failed to save banned_users.json: {e}")
+
 async def on_timeout(self):
     await self.message.edit(content="🛞 Pit stop cancelled: No tyre selected in time.", view=None)
 
@@ -230,14 +257,10 @@ def get_zcoin_emoji(ctx):
 
 def migrate_to_car_parts():
     global career_stats
-    try:
-        with open("career_stats.json", "r") as f:
-            career_stats = json.load(f)
-    except FileNotFoundError:
-        career_stats = {}
-        logger.info("No career_stats.json found, starting fresh.")
+    if not career_stats:
+        logger.info("No career_stats to migrate, skipping migration.")
         return
-    for user_id, stats in career_stats.items():
+    for user_id, stats in list(career_stats.items()):  # Use list to avoid runtime dict changes
         user_id = int(user_id)
         if "car_parts" not in stats:
             stats["car_parts"] = {
@@ -263,12 +286,8 @@ def migrate_to_car_parts():
         for key in ["last_daily", "last_weekly", "last_monthly"]:
             if key not in stats:
                 stats[key] = 0
-    try:
-        with open("career_stats.json", "w") as f:
-            json.dump(career_stats, f, indent=4)
-        logger.info("Migration to car parts and tournament stats completed successfully!")
-    except Exception as e:
-        logger.error(f"Migration failed: {e}")
+    save_career_stats()
+    logger.info("Migration to car parts and tournament stats completed successfully!")
 
 def apply_track_conditions(lobby, player_data, strategy):
     conditions = lobby["conditions"]
@@ -292,49 +311,35 @@ def apply_track_conditions(lobby, player_data, strategy):
     }
     # Apply part contributions with exponential scaling
     scaling_factor = 1.0 
-    stats["top_speed"] += (profile["car_parts"]["engine"] - 5) / 5 * 8 * scaling_factor
-    scaling_factor = 1.0 
-    stats["acceleration"] += (profile["car_parts"]["engine"] - 5) / 5 * 4 * scaling_factor
-    scaling_factor = 1.0 
-    stats["acceleration"] += (profile["car_parts"]["gearbox"] - 5) / 5 * 4 * scaling_factor
-    scaling_factor = 1.0 
+    stats["top_speed"] += (profile["car_parts"]["engine"] - 5) / 5 * 8 * scaling_factor 
+    stats["acceleration"] += (profile["car_parts"]["engine"] - 5) / 5 * 4 * scaling_factor 
+    stats["acceleration"] += (profile["car_parts"]["gearbox"] - 5) / 5 * 4 * scaling_factor 
     stats["overtaking"] += (profile["car_parts"]["aero"] - 5) / 5 * 6 * scaling_factor
-    stats["cornering"] += (profile["car_parts"]["aero"] - 5) / 5 * 4 * scaling_factor
-    scaling_factor = 1.0 
-    stats["cornering"] += (profile["car_parts"]["chassis"] - 5) / 5 * 2 * scaling_factor
-    scaling_factor = 1.0 
-    stats["cornering"] += (profile["car_parts"]["suspension"] - 5) / 5 * 4 * scaling_factor
-    scaling_factor = 1.0 
-    stats["tyre_management"] += (profile["car_parts"]["tyres"] - 5) / 5 * 8 * scaling_factor
-    scaling_factor = 1.0 
-    stats["tyre_management"] += (profile["car_parts"]["suspension"] - 5) / 5 * 4 * scaling_factor
-    scaling_factor = 1.0 
-    stats["reliability"] += (profile["car_parts"]["chassis"] - 5) / 5 * 6 * scaling_factor
-    scaling_factor = 1.0 
+    stats["cornering"] += (profile["car_parts"]["aero"] - 5) / 5 * 4 * scaling_factor 
+    stats["cornering"] += (profile["car_parts"]["chassis"] - 5) / 5 * 2 * scaling_factor 
+    stats["cornering"] += (profile["car_parts"]["suspension"] - 5) / 5 * 4 * scaling_factor 
+    stats["tyre_management"] += (profile["car_parts"]["tyres"] - 5) / 5 * 8 * scaling_factor 
+    stats["tyre_management"] += (profile["car_parts"]["suspension"] - 5) / 5 * 4 * scaling_factor 
+    stats["reliability"] += (profile["car_parts"]["chassis"] - 5) / 5 * 6 * scaling_factor 
     stats["reliability"] += (profile["car_parts"]["gearbox"] - 5) / 5 * 4 * scaling_factor
     
     # Speed: Adjusts base lap time
     speed_multipliers = {"High": 0.97, "Medium": 1.00, "Low": 1.03}
     speed_multiplier = speed_multipliers.get(conditions["speed"], 1.00)
-    top_speed_mod = 1.0 - (stats["top_speed"] / 100.0) * 0.035 * (1 if conditions["speed"] == "High" else 0.5)
-    speed_multiplier *= top_speed_mod
-    
-    # Acceleration: Adjusts fuel usage
-    accel_multipliers = {"High": 1.20, "Medium": 1.00, "Low": 0.80}
-    accel_multiplier = accel_multipliers.get(conditions["acceleration"], 1.00)
-    accel_mod = 1.0 - (stats["acceleration"] / 100.0) * 0.20 * (1 if conditions["acceleration"] == "High" else 0.5)
-    accel_multiplier *= accel_mod
+    top_speed_mod = 1.0 - (stats["top_speed"] / 100.0) * 0.025 * (1 if conditions["speed"] == "High" else 0.5)
+    accel_mod = 1.0 - (stats["acceleration"] / 100.0) * 0.01 * (1 if conditions["acceleration"] == "High" else 0.5)
+    speed_multiplier *= top_speed_mod * accel_mod
     
     # Overtaking: Adjusts driver variance
     overtaking_ranges = {
-        "Easy": (0.95, 1.05),
-        "Medium": (0.97, 1.03),
-        "Hard": (0.99, 1.01)
+        "Easy": (0.98, 1.02),
+        "Medium": (0.99, 1.01),
+        "Hard": (0.998, 1.002)
     }
-    base_min, base_max = overtaking_ranges.get(conditions["overtaking"], (0.99, 1.01))
+    base_min, base_max = overtaking_ranges.get(conditions["overtaking"], (0.995, 1.005))
     overtaking_mod = stats["overtaking"] / 100.0
-    variance_min = base_min - (0.015 * overtaking_mod if conditions["overtaking"] == "Easy" else 0.008 * overtaking_mod)
-    variance_max = base_max + (0.015 * overtaking_mod if conditions["overtaking"] == "Easy" else 0.008 * overtaking_mod)
+    variance_min = base_min - (0.02 * overtaking_mod if conditions["overtaking"] == "Easy" else 0.015 * overtaking_mod if conditions["overtaking"] == "Medium" else 0.01 * overtaking_mod)
+    variance_max = base_max + (0.02 * overtaking_mod if conditions["overtaking"] == "Easy" else 0.015 * overtaking_mod if conditions["overtaking"] == "Medium" else 0.01 * overtaking_mod)
     
     # Corners: Adjusts tyre wear
     corner_tyre_wear = {"Few": 1.0, "Moderate": 1.1, "Many": 1.2}
@@ -347,9 +352,9 @@ def apply_track_conditions(lobby, player_data, strategy):
     
     # Crash risks
     collision_risks = {
-        "Easy": 0.003 if strategy == "Push" else 0.001,  # Reduced for balance
-        "Medium": 0.007 if strategy == "Push" else 0.004,
-        "Hard": 0.010 if strategy == "Push" else 0.006
+        "Easy": 0.002 if strategy == "Push" else 0.001,  # Reduced for balance
+        "Medium": 0.004 if strategy == "Push" else 0.002,
+        "Hard": 0.008 if strategy == "Push" else 0.003
     }
     reliability_mod = max(0, 1.0 - (stats["reliability"] / 100.0) * 0.75)  # Cap at 0
     crash_risks = {
@@ -358,7 +363,7 @@ def apply_track_conditions(lobby, player_data, strategy):
         "Gearbox Issue": {"Few": 0.0, "Moderate": 0.001, "Many": 0.002}.get(conditions["corners"], 0.001) * reliability_mod
     }
     
-    return speed_multiplier, accel_multiplier, variance_min, variance_max, tyre_wear_multiplier * tyre_management_mod, crash_risks["Collision"], crash_risks["Engine Failure"], crash_risks["Gearbox Issue"]
+    return speed_multiplier, variance_min, variance_max, tyre_wear_multiplier * tyre_management_mod, crash_risks["Collision"], crash_risks["Engine Failure"], crash_risks["Gearbox Issue"]
 
 @bot.command()
 async def create(ctx):
@@ -545,6 +550,10 @@ async def tracks(ctx):
 async def join(ctx):
     channel_id = ctx.channel.id
     user_id = ctx.author.id
+    guild_id = str(ctx.guild.id)
+    if guild_id in banned_users and str(user_id) in banned_users[guild_id]:
+        await ctx.send("🚫 You are banned from joining races in this server.")
+        return
     if channel_id not in lobbies:
         await ctx.send("❌ No active race lobby in this channel. Use `!create` to start one.")
         return
@@ -649,7 +658,6 @@ async def start(ctx):
                 "tyre": initial_tyre,
                 "last_pit_lap": 0,
                 "total_time": 0.0,
-                "fuel": 100.0,
                 "tyre_condition": 100.0,
                 "dnf": False,
                 "dnf_reason": None,
@@ -703,7 +711,7 @@ async def start(ctx):
 
 async def race_loop(ctx, channel_id, status_msg, total_laps):
     try:
-        lap_delay = 5.0
+        lap_delay = 4.0
         while channel_id in lobbies:
             lap_start_time = time.time()
             if channel_id not in lobbies:
@@ -761,26 +769,27 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     pdata["last_pit_lap"] = current_lap
                     just_pitted = True
                     logger.info(f"🛞 PIT STOP TRIGGERED for {pid} (User: {lobby['users'].get(pid, {'name': 'Unknown'}).name}) on lap {current_lap}, Penalty: {pit_penalty}s")
-                    logger.debug(f"Before pit reset: Fuel={pdata.get('fuel')}, Tyre condition={pdata.get('tyre_condition')}")
-                    pdata["fuel"] = 100.0
+                    logger.debug(f"Before pit reset: Tyre condition={pdata.get('tyre_condition')}")
                     pdata["tyre_condition"] = 100.0
-                    logger.debug(f"After pit reset: Fuel={pdata['fuel']}, Tyre condition={pdata['tyre_condition']}, Strategy reset to Balanced")
+                    logger.debug(f"After pit reset: Tyre condition={pdata['tyre_condition']}, Strategy reset to Balanced")
                     
                 # Replace the degradation block starting with `if not just_pitted and not lobby.get("safety_car_active", False):`
                 if not lobby.get("safety_car_active", False):
-                    base_fuel_usage = {"Push": 6.0, "Balanced": 4.0, "Save": 2.0}.get(strategy, 4.0)
                     base_wear = {"Push": 8.0, "Balanced": 5.0, "Save": 3.0}.get(strategy, 5.0)
-                    speed_multiplier, accel_multiplier, variance_min, variance_max, tyre_wear_multiplier, collision_risk, engine_risk, gearbox_risk = apply_track_conditions(lobby, pdata, strategy)
+                    speed_multiplier, variance_min, variance_max, tyre_wear_multiplier, collision_risk, engine_risk, gearbox_risk = apply_track_conditions(lobby, pdata, strategy)
                     base_lap_time *= speed_multiplier
-                    fuel_usage = base_fuel_usage * accel_multiplier
                     tyre_type_wear = {
-                        "Soft": 1.25,
+                        "Soft": 1.2,
                         "Medium": 1.0,
-                        "Hard": 0.75,
+                        "Hard": 0.8,
                         "Intermediate": 1.1,
                         "Wet": 0.9
                     }.get(tyre, 1.0)
                     tyre_wear = base_wear * tyre_type_wear * tyre_wear_multiplier
+                    if just_pitted or pdata["last_pit_lap"] == current_lap:
+                        tyre_wear = 0.0  # Skip degradation on pit lap
+                        pdata["tyre_condition"] = 100.0  # Ensure tyre condition is reset
+                        logger.debug(f"🛞 Skipping tyre degradation for {pid} on lap {current_lap} due to pit stop") 
                     if weather == "🌦️ Light Rain":
                         if tyre == "Intermediate":
                             tyre_wear *= 0.85
@@ -796,10 +805,8 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                             tyre_wear *= 1.6
                         elif tyre == "Intermediate":
                             tyre_wear *= 1.3
-                    logger.debug(f"🔧 Degradation - Fuel Usage: {fuel_usage}, Tyre Wear: {tyre_wear}, Weather: {weather}, Track Conditions: Speed={speed_multiplier}, Accel={accel_multiplier}, Corners={tyre_wear_multiplier}, Crash Risks: Collision={collision_risk}, Engine={engine_risk}, Gearbox={gearbox_risk}")
-                    prev_fuel = pdata.get("fuel", 100.0)
+                    logger.debug(f"🔧 Degradation - Tyre Wear: {tyre_wear}, Weather: {weather}, Track Conditions: Speed={speed_multiplier}, Corners={tyre_wear_multiplier}, Crash Risks: Collision={collision_risk}, Engine={engine_risk}, Gearbox={gearbox_risk}")
                     prev_tyre = pdata.get("tyre_condition", 100.0)
-                    pdata["fuel"] = max(prev_fuel - fuel_usage, 0.0)
                     pdata["tyre_condition"] = max(prev_tyre - tyre_wear, 0.0)
             # Check for crashes
                     crash_types = [
@@ -833,9 +840,9 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                                     logger.warning(f"Failed to send crash DM to {pid}")
                 logger.debug(f"Checking safety car: collision_occurred={collision_occurred}, lap={current_lap}")
                 await handle_safety_car(ctx, lobby, current_lap, collision_occurred)
-                if pdata.get("fuel", 0.0) <= 0 or pdata.get("tyre_condition", 0.0) <= 0:
+                if pdata.get("tyre_condition", 0.0) <= 0:
                     pdata["dnf"] = True
-                    pdata["dnf_reason"] = "Out of fuel" if pdata.get("fuel", 0.0) <= 0 else "Tyres worn out"
+                    pdata["dnf_reason"] = "Tyres worn out"
                     logger.info(f"💀 DNF: {pid} DNFed on lap {current_lap}: {pdata['dnf_reason']}")
                     embed = discord.Embed(
                         title="🏎️ DNF Alert!",
@@ -844,26 +851,26 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     )
                     await safe_send(ctx, embed=embed)
                 strat_factor = {
-                    "Push": 0.96,
+                    "Push": 0.975,
                     "Balanced": 1.0,
-                    "Save": 1.04,
+                    "Save": 1.025,
                     "Pit Stop": 1.15
                 }.get(strategy, 1.0)
                 weather_penalty = {
                     ("☀️ Sunny", "Soft"): 1.0,
-                    ("☀️ Sunny", "Medium"): 1.02,
-                    ("☀️ Sunny", "Hard"): 1.04,
-                    ("☀️ Sunny", "Wet"): 1.4,
-                    ("☀️ Sunny", "Intermediate"): 1.3,
-                    ("🌦️ Light Rain", "Soft"): 1.35,
-                    ("🌦️ Light Rain", "Medium"): 1.25,
-                    ("🌦️ Light Rain", "Hard"): 1.3,
+                    ("☀️ Sunny", "Medium"): 1.015,
+                    ("☀️ Sunny", "Hard"): 1.03,
+                    ("☀️ Sunny", "Wet"): 1.3,
+                    ("☀️ Sunny", "Intermediate"): 1.2,
+                    ("🌦️ Light Rain", "Soft"): 1.25,
+                    ("🌦️ Light Rain", "Medium"): 1.15,
+                    ("🌦️ Light Rain", "Hard"): 1.2,
                     ("🌦️ Light Rain", "Intermediate"): 1.0,
-                    ("🌦️ Light Rain", "Wet"): 1.1,
-                    ("🌧️ Heavy Rain", "Soft"): 1.5,
-                    ("🌧️ Heavy Rain", "Medium"): 1.4,
-                    ("🌧️ Heavy Rain", "Hard"): 1.45,
-                    ("🌧️ Heavy Rain", "Intermediate"): 1.15,
+                    ("🌦️ Light Rain", "Wet"): 1.05,
+                    ("🌧️ Heavy Rain", "Soft"): 1.4,
+                    ("🌧️ Heavy Rain", "Medium"): 1.3,
+                    ("🌧️ Heavy Rain", "Hard"): 1.35,
+                    ("🌧️ Heavy Rain", "Intermediate"): 1.1,
                     ("🌧️ Heavy Rain", "Wet"): 1.0,
                     ("☁️ Cloudy", "Soft"): 1.0,
                     ("☁️ Cloudy", "Medium"): 1.0,
@@ -873,13 +880,17 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     ("🌬️ Windy", "Soft"): 1.1,
                     ("🌬️ Windy", "Medium"): 1.05,
                     ("🌬️ Windy", "Hard"): 1.0,
-                    ("🌬️ Windy", "Wet"): 1.35,
+                    ("🌬️ Windy", "Wet"): 1.3,
                     ("🌬️ Windy", "Intermediate"): 1.2
                 }.get((weather, tyre), 1.0)
                 tyre_wear_penalty = 1.0 + ((100.0 - pdata["tyre_condition"]) / 100.0) * 0.1
-                fuel_penalty = 1.0
-                driver_variance = 1.0 if lobby.get("safety_car_active", False) else random.uniform(variance_min, variance_max)
-                lap_time = (base_lap_time * strat_factor * weather_penalty * tyre_wear_penalty * fuel_penalty + pit_penalty) * driver_variance
+                if not lobby.get("safety_car_active", False):
+                    trend = lobby["player_data"][pid].get("variance_trend", 1.0)
+                    driver_variance = random.uniform(variance_min, variance_max) * (0.7 + 0.3 * trend) 
+                    lobby["player_data"][pid]["variance_trend"] = max(0.9, min(1.1, trend + random.uniform(-0.05, 0.05)))
+                else:
+                    driver_variance = 1.0
+                lap_time = (base_lap_time * strat_factor * weather_penalty * tyre_wear_penalty + pit_penalty) * driver_variance
                 if just_pitted:
                     pdata["strategy"] = "Balanced"
                 if lobby.get("safety_car_active", False):
@@ -890,15 +901,15 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                 player_times[pid] = total_time
                 # Note: This is a partial snippet for the debug log line (~512) in race_loop.
                 # Replace only the debug log line within the `for pid in lobby["players"]:` loop.
-                logger.debug(f"🏎 {pid} (User: {lobby['users'].get(pid, {'name': 'Unknown'}).name}) - Pos: {lobby['position_order'].index(pid)+1 if pid in lobby['position_order'] else 'N/A'}, Strat: {strategy}, Lap: {lap_time:.2f}s, Pit penalty: {pit_penalty}s, Total: {total_time:.2f}s, Fuel: {pdata['fuel']:.1f}%, Tyre: {pdata['tyre_condition']:.1f}%")
+                logger.debug(f"🏎 {pid} (User: {lobby['users'].get(pid, {'name': 'Unknown'}).name}) - Pos: {lobby['position_order'].index(pid)+1 if pid in lobby['position_order'] else 'N/A'}, Strat: {strategy}, Lap: {lap_time:.2f}s, Pit penalty: {pit_penalty}s, Total: {total_time:.2f}s, Tyre: {pdata['tyre_condition']:.1f}%")
             valid_players = [pid for pid in lobby["players"] if not lobby["player_data"].get(pid, {}).get("dnf", False)]
             lobby["position_order"] = sorted(valid_players, key=lambda pid: lobby["player_data"].get(pid, {}).get("total_time", float('inf')))
             # Log position order after update
             position_info = []
             for pid in lobby['position_order']:
-               player_data = lobby['player_data'][pid]
-               user = lobby['users'].get(pid, {'name': f'Unknown ({pid})'})
-               position_info.append(f"{user.name} ({player_data['total_time']:.2f}s)")
+                player_data = lobby['player_data'][pid]
+                user = lobby['users'].get(pid, {'name': f'Unknown ({pid})'})
+                position_info.append(f"{user.name} ({player_data['total_time']:.2f}s)")
             logger.info(f"Position order after lap {current_lap}: {position_info}")
             embed = generate_race_status_embed(lobby)
             try:
@@ -927,13 +938,11 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     except ValueError:
                         position = "?"
                 total = len(lobby["players"])
-                fuel = round(pdata.get("fuel", 0.0), 1)
                 tyre_cond = round(pdata.get("tyre_condition", 0.0), 1)
                 weather_emoji = lobby["weather"]
                 safety_car_status = "🚨 Active" if lobby.get("safety_car_active", False) else "Inactive"
                 last_sent_lap = pdata.get("last_sent_lap", 0)
                 if (current_lap != last_sent_lap or
-                    abs(pdata["fuel"] - pdata.get("last_sent_fuel", 100.0)) > 5 or
                     abs(pdata["tyre_condition"] - pdata.get("last_sent_tyre", 100.0)) > 5 or
                     position != pdata.get("last_position", "?")):
                     embed = discord.Embed(
@@ -943,7 +952,6 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                             f"🏁 Lap **{current_lap}/{total_laps}**\n"
                             f"Weather: **{weather_emoji}**\n"
                             f"🚨 Safety Car: **{safety_car_status}**\n"
-                            f"⛽ Fuel: **{fuel}%**\n"
                             f"🛞 Tyre Condition: **{tyre_cond}%**"
                         ),
                         color=discord.Color.orange()
@@ -958,7 +966,6 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                     if dm_msg:
                         try:
                             await dm_msg.edit(embed=embed)
-                            pdata["last_sent_fuel"] = pdata["fuel"]
                             pdata["last_sent_tyre"] = pdata["tyre_condition"]
                             pdata["last_position"] = position
                             pdata["last_sent_lap"] = current_lap
@@ -968,7 +975,6 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                             try:
                                 new_dm = await user.send(embed=embed)
                                 pdata["dm_msg"] = new_dm
-                                pdata["last_sent_fuel"] = pdata["fuel"]
                                 pdata["last_sent_tyre"] = pdata["tyre_condition"]
                                 pdata["last_position"] = position
                                 pdata["last_sent_lap"] = current_lap
@@ -979,7 +985,6 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
                         try:
                             new_dm = await user.send(embed=embed)
                             pdata["dm_msg"] = new_dm
-                            pdata["last_sent_fuel"] = pdata["fuel"]
                             pdata["last_sent_tyre"] = pdata["tyre_condition"]
                             pdata["last_position"] = position
                             pdata["last_sent_lap"] = current_lap
@@ -1001,6 +1006,15 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
         podium_emojis = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
         leader_time = lobby["player_data"][final_order[0]]["total_time"] if final_order else None
         update_leaderboard = lobby["race_mode"] == "championship"
+        zcoin_rewards = {1: 30, 2: 20, 3: 10}  # Zcoin rewards for top 3
+        zcoin_message = []
+        if len(lobby["players"]) >= 6:  # Only award zcoins if 6 or more players
+            for pos, pid in enumerate(final_order[:3], 1):  # Top 3 only
+                if pid in lobby["users"]:
+                    profile = get_player_profile(pid)
+                    zcoins_earned = zcoin_rewards.get(pos, 0)
+                    profile["zcoins"] = profile.get("zcoins", 0) + zcoins_earned
+                    zcoin_message.append(f"{lobby['users'][pid].name} (P{pos}) earned {zcoins_earned} {get_zcoin_emoji(ctx)}!")
         for pos, pid in enumerate(final_order, 1):
             user = lobby["users"].get(pid)
             if not user:
@@ -1032,6 +1046,12 @@ async def race_loop(ctx, channel_id, status_msg, total_laps):
             embed.add_field(
                 name="❌ DNFs",
                 value="\n".join(dnf_names) if dnf_names else "No DNFs recorded.",
+                inline=False
+            )
+        if zcoin_message:
+            embed.add_field(
+                name="💰 Zcoin Rewards",
+                value="\n".join(zcoin_message),
                 inline=False
             )
         if lobby["mode"] == "duo":
@@ -1249,26 +1269,40 @@ class TyreView(View):
         await self._select_tyre(interaction, "Wet")
 
 async def handle_safety_car(ctx, lobby, current_lap, collision_occurred):
-    logger.debug(f"handle_safety_car called: active={lobby.get('safety_car_active', False)}, laps={lobby.get('safety_car_laps', 0)}, collision={collision_occurred}")
+    logger.debug(f"handle_safety_car: lap={current_lap}, active={lobby.get('safety_car_active', False)}, laps={lobby.get('safety_car_laps', 0)}, collision={collision_occurred}")
+
+    # Initialize cooldown if not present
+    if "safety_car_cooldown" not in lobby:
+        lobby["safety_car_cooldown"] = 0
+
+    # Handle active safety car
     if lobby.get("safety_car_active", False):
-        if "safety_car_laps" in lobby:
-            lobby["safety_car_laps"] = max(0, lobby["safety_car_laps"] - 1)
-            logger.debug(f"Safety car active, laps remaining: {lobby['safety_car_laps']}")
-            if lobby["safety_car_laps"] == 0:
-                lobby["safety_car_active"] = False
-                embed = discord.Embed(
-                    title="🏎️🏁 Safety Car In!",
-                    description=f"✦ The safety car has returned to the pits on Lap {current_lap}! Racing resumes. ✦",
-                    color=discord.Color.green()
-                )
-                embed.set_footer(text="🏆 Adjust your strategy!")
-                await safe_send(ctx, embed=embed)
-                logger.info(f"Safety car ended on lap {current_lap} in channel {ctx.channel.id}")
+        lobby["safety_car_laps"] = max(0, lobby["safety_car_laps"] - 1)
+        logger.info(f"Safety car active on lap {current_lap}, laps remaining: {lobby['safety_car_laps']}")
+        
+        if lobby["safety_car_laps"] == 0:
+            lobby["safety_car_active"] = False
+            lobby["safety_car_cooldown"] = 3  # Set cooldown to 3 laps after safety car ends
+            embed = discord.Embed(
+                title="🏎️🏁 Safety Car In!",
+                description=f"✦ The safety car has returned to the pits on Lap {current_lap}! Racing resumes. ✦",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="🏆 Adjust your strategy!")
+            await safe_send(ctx, embed=embed)
+            logger.info(f"Safety car ended on lap {current_lap} in channel {ctx.channel.id}")
         return
-    if collision_occurred and current_lap < lobby["laps"] - 5:
-        logger.debug(f"Deploying safety car due to collision on lap {current_lap}")
+
+    # Decrement cooldown
+    lobby["safety_car_cooldown"] = max(0, lobby["safety_car_cooldown"] - 1)
+    if lobby["safety_car_cooldown"] > 0:
+        logger.debug(f"Safety car on cooldown: {lobby['safety_car_cooldown']} laps remaining")
+
+    # Deploy safety car if conditions are met
+    if collision_occurred and lobby["safety_car_cooldown"] == 0 and current_lap < lobby["laps"] - 2:
+        logger.info(f"Deploying safety car due to collision on lap {current_lap}")
         lobby["safety_car_active"] = True
-        lobby["safety_car_laps"] = random.randint(2, 4)
+        lobby["safety_car_laps"] = random.randint(2, min(4, lobby["laps"] - current_lap - 1))  # Ensure safety car doesn't exceed race length
         embed = discord.Embed(
             title="🏎️🏁 Safety Car Deployed!",
             description=f"✦ Collision on Lap {current_lap}! Safety car out for {lobby['safety_car_laps']} laps. ✦",
@@ -1276,12 +1310,12 @@ async def handle_safety_car(ctx, lobby, current_lap, collision_occurred):
         )
         embed.add_field(
             name="Impact",
-            value="⚡ Slower laps\n🛞 No fuel/tyre wear\n🏎️ No overtaking",
+            value="⚡ Slower laps\n🛞 No tyre wear\n🏎️ No overtaking",
             inline=False
         )
         embed.set_footer(text="🏆 Use your DM panel to plan your strategy!")
         await safe_send(ctx, embed=embed)
-        logger.info(f"Safety car deployed on lap {current_lap} for {lobby['safety_car_laps']} laps due to collision in channel {ctx.channel.id}")
+        logger.info(f"Safety car deployed on lap {current_lap} for {lobby['safety_car_laps']} laps in channel {ctx.channel.id}")
 
 @bot.command(name="help")
 async def help(ctx):
@@ -1372,16 +1406,6 @@ async def help(ctx):
     )
     embed.set_footer(text="🏁 Use DM panel to adjust strategy during races!")
     await ctx.send(embed=embed)
-
-@bot.event
-async def on_ready():
-    logger.info("Starting bot initialization...")
-    load_career_stats()
-    migrate_to_car_parts()
-    logger.info(f'🚀 {bot.user} has connected to Discord!')
-    logger.info(f"Career stats after load: {career_stats}")
-    # Start autosave task
-    bot.loop.create_task(autosave_career_stats())
 
 async def autosave_career_stats():
     while True:
@@ -1643,10 +1667,12 @@ async def yeet(ctx):
         await ctx.send(embed=embed)
         return
     lobby = lobbies[channel_id]
-    if user_id != lobby["host"]:
+    # Check if user is admin, has "Game Host" role, or is the lobby host
+    has_game_host_role = any(role.name.lower() == "game host" for role in ctx.author.roles)
+    if not (ctx.author.guild_permissions.administrator or has_game_host_role or user_id == lobby["host"]):
         embed = discord.Embed(
             title="🚫 Permission Denied",
-            description="Only the host can yeet the lobby.",
+            description="Only server admins, users with the 'Game Host' role, or the lobby host can yeet the lobby.",
             color=discord.Color.red()
         )
         await ctx.send(embed=embed)
@@ -1783,7 +1809,6 @@ async def leaderboard(ctx):
         career_stats.items(),
         key=lambda x: (-x[1]["tournament_stats"]["points"], x[1]["races"])
     )
-    zcoin_emoji = get_zcoin_emoji(ctx)
     leaderboard_lines = []
     number_emojis = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
     for rank, (user_id, stats) in enumerate(sorted_players, 1):
@@ -1800,14 +1825,12 @@ async def leaderboard(ctx):
             continue
         emoji = number_emojis.get(rank, f"{rank}.")
         leaderboard_lines.append(f"{emoji} **{name}** — {points} pts")
-    zcoin_emoji = get_zcoin_emoji(ctx)
     embed = discord.Embed(
         title="🏆 Formula Z Leaderboard",
         description="\n".join(leaderboard_lines) if leaderboard_lines else "No championship points recorded yet!",
         color=discord.Color.gold()
     )
-    embed.set_thumbnail(url="https://i.imgur.com/8zX0J5g.png")
-    embed.set_footer(text=f"ZCoin: {zcoin_emoji} | Compete in championship races to climb the ranks!")
+    embed.set_footer(text=f"Compete in championship races to climb the ranks!")
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -2494,6 +2517,7 @@ async def logs(ctx, time_period: str = None):
 async def on_ready():
     logger.info("Starting bot initialization...")
     load_career_stats()
+    load_banned_users()
     migrate_to_car_parts()
     
     # Initialize server counts in logs
@@ -2530,9 +2554,111 @@ async def on_ready():
     save_logs(logs)
     
     logger.info(f'🚀 {bot.user} has connected to Discord!')
-    logger.info(f"Career stats after load: {career_stats}")
     # Start autosave task
     bot.loop.create_task(autosave_career_stats())
+
+def is_authorized():
+    def predicate(ctx):
+        if ctx.author.id not in AUTHORIZED_USERS:
+            raise commands.CheckFailure("You are not authorized to use this command.")
+        return True
+    return commands.check(predicate)
+
+@bot.command()
+@is_authorized()
+async def givecoins(ctx, member: discord.Member, amount: int):
+    if amount <= 0:
+        embed = discord.Embed(
+            title="❌ Invalid Amount",
+            description="Amount must be a positive number.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+    profile = get_player_profile(member.id)
+    zcoin_emoji = get_zcoin_emoji(ctx)
+    profile["zcoins"] += amount
+    save_career_stats()
+    logger.info(f"User {ctx.author.id} granted {amount} Zcoins to {member.id}")
+    embed = discord.Embed(
+        title="💰 Zcoins Granted",
+        description=f"Successfully gave **{amount}** {zcoin_emoji} to {member.mention}.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+    try:
+        await member.send(f"🎉 You received **{amount}** {zcoin_emoji} from {ctx.author.name}!")
+    except discord.Forbidden:
+        logger.warning(f"Could not DM {member.id} about Zcoin grant")
+
+@bot.command()
+@is_authorized()
+async def resetprofile(ctx, member: discord.Member):
+    user_id = member.id
+    career_stats[user_id] = default_player_profile.copy()
+    save_career_stats()
+    logger.info(f"User {ctx.author.id} reset profile for {user_id}")
+    embed = discord.Embed(
+        title="✅ Profile Reset",
+        description=f"{member.mention}'s career stats have been reset to default.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+    try:
+        await member.send("🚨 Your Formula Z career profile has been reset by a moderator.")
+    except discord.Forbidden:
+        logger.warning(f"Could not DM {member.id} about profile reset")
+
+@bot.command()
+@is_authorized()
+async def ban(ctx, member: discord.Member):
+    guild_id = str(ctx.guild.id)
+    user_id = str(member.id)
+    if guild_id not in banned_users:
+        banned_users[guild_id] = []
+    if user_id in banned_users[guild_id]:
+        embed = discord.Embed(
+            title="❌ Already Banned",
+            description=f"{member.mention} is already banned from races in this server.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+    banned_users[guild_id].append(user_id)
+    save_banned_users()
+    logger.info(f"User {ctx.author.id} banned {member.id} from races in guild {guild_id}")
+    embed = discord.Embed(
+        title="🚫 User Banned",
+        description=f"{member.mention} has been banned from joining races in this server.",
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
+    try:
+        await member.send(f"🚫 You have been banned from joining Formula Z races in {ctx.guild.name}.")
+    except discord.Forbidden:
+        logger.warning(f"Could not DM {member.id} about ban")
+
+CONTROLLED_ROLE_ID = 1382072723143921684
+
+@bot.command()
+async def pingrole(ctx):
+    role = ctx.guild.get_role(CONTROLLED_ROLE_ID)
+    if role is None:
+        await ctx.send("Role not found.")
+        return
+    
+    now = time.time()
+    last_ping = role_cooldowns.get(role.id, 0)
+    time_since_last_ping = now - last_ping
+
+    if time_since_last_ping < COOLDOWN_SECONDS:
+        time_left = int((COOLDOWN_SECONDS - time_since_last_ping) // 60) + 1
+        await ctx.send(f"Please wait {time_left} minute(s) before pinging this role again.")
+        return
+
+    # Ping allowed
+    role_cooldowns[role.id] = now
+    await ctx.send(f"{role.mention} has been pinged!")
 
 
 
