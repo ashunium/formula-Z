@@ -1,0 +1,1971 @@
+import discord
+from discord import app_commands, SelectOption, Interaction
+from discord.ext import commands
+import random
+import asyncio
+import logging
+import json
+import os
+from asyncio import Lock
+from typing import Dict, List, Tuple, Optional, Literal
+from dataclasses import dataclass
+import time
+from discord.ui import View, Button, Select
+import uuid
+import aiohttp
+import aiohttp.resolver
+import aiodns
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Bot configuration
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+# Constants
+@dataclass
+class TrackInfo:
+    laps: int
+    base_time: int
+    wear_modifier: float
+    weather_weights: List[float]
+    condition_weights: List[float]
+
+@dataclass
+class Card:
+    name: str
+    season: int
+    attack: int
+    defence: int
+    rarity: str
+    card_id: str
+    type: str
+
+CONSTANTS = {
+    'DEFAULT_TYRES': {'soft': 5, 'medium': 4, 'hard': 4, 'intermediate': 4, 'wet': 3},
+    'TYRE_SPEED': {'soft': 1.0, 'medium': 1.02, 'hard': 1.05, 'intermediate': 1.10, 'wet': 1.15},
+    'TYRE_WEAR': {'soft': 0.0735, 'medium': 0.0535, 'hard': 0.0392, 'intermediate': 0.0571, 'wet': 0.0448},
+    'TYRE_EMOJI': {
+        'soft': '<:soft:1391432361383563294>',
+        'medium': '<:medium:1391432455793414226>',
+        'hard': '<:hard:1391432537414434876>',
+        'intermediate': '<:intermedium:1391432604690944093>',
+        'wet': '<:wet:1391432674782216232>'
+    },
+    'WEATHER_EMOJI': {'Sunny': '☀️', 'Cloudy': '🌥️', 'Light Rain': '🌧️', 'Heavy Rain': '⛈️', 'Foggy': '🌫️'},
+    'STRATEGY_MODIFIER': {'push': 0.98, 'balanced': 1.0, 'save': 1.02},
+    'STRATEGY_WEAR': {'push': 1.2, 'balanced': 1.0, 'save': 0.6},
+    'F1_POINTS': [25, 18, 15, 12, 10, 8, 6, 4, 2, 1],
+    'WEATHER_TYPES': ['Sunny', 'Cloudy', 'Light Rain', 'Heavy Rain', 'Foggy'],
+    'TRACK_CONDITIONS': ['High Grip', 'Low Grip', 'Oil Spill', 'High Downforce'],
+    'AI_PLAYER_NAMES': ['AI_Max Verstappen', 'AI_Lando Norris', 'AI_Charles Leclerc', 'AI_Lewis Hamilton', 'AI_Oscar Piastri'],
+    'TRACKS': {
+        'Albert Park': TrackInfo(
+            laps=58, base_time=90, wear_modifier=0.8,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Temperate, some rain possible
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Suzuka': TrackInfo(
+            laps=53, base_time=100, wear_modifier=0.75,
+            weather_weights=[0.4, 0.3, 0.2, 0.08, 0.02],  # Japan, rainy season possible
+            condition_weights=[0.45, 0.35, 0.05, 0.15]
+        ),
+        'Jeddah Corniche': TrackInfo(
+            laps=50, base_time=95, wear_modifier=0.85,
+            weather_weights=[0.85, 0.1, 0.0, 0.0, 0.05],  # Desert, very dry
+            condition_weights=[0.6, 0.25, 0.05, 0.1]
+        ),
+        'Monaco': TrackInfo(
+            laps=78, base_time=110, wear_modifier=0.9,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Mediterranean, some rain
+            condition_weights=[0.4, 0.4, 0.1, 0.1]
+        ),
+        'Lusail International': TrackInfo(
+            laps=57, base_time=105, wear_modifier=0.9,
+            weather_weights=[0.9, 0.08, 0.0, 0.0, 0.02],  # Desert, very dry
+            condition_weights=[0.6, 0.25, 0.05, 0.1]
+        ),
+        'Bahrain': TrackInfo(
+            laps=57, base_time=105, wear_modifier=0.9,
+            weather_weights=[0.9, 0.08, 0.0, 0.0, 0.02],  # Desert, very dry
+            condition_weights=[0.6, 0.25, 0.05, 0.1]
+        ),
+        'Imola': TrackInfo(
+            laps=63, base_time=95, wear_modifier=0.8,
+            weather_weights=[0.45, 0.3, 0.2, 0.05, 0.0],  # Temperate, some rain
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Silverstone': TrackInfo(
+            laps=52, base_time=90, wear_modifier=0.85,
+            weather_weights=[0.35, 0.3, 0.25, 0.08, 0.02],  # UK, frequent rain
+            condition_weights=[0.45, 0.35, 0.05, 0.15]
+        ),
+        'Spa-Francorchamps': TrackInfo(
+            laps=44, base_time=110, wear_modifier=0.75,
+            weather_weights=[0.3, 0.3, 0.3, 0.08, 0.02],  # Belgium, very rainy
+            condition_weights=[0.4, 0.4, 0.05, 0.15]
+        ),
+        'Monza': TrackInfo(
+            laps=53, base_time=85, wear_modifier=0.8,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Italy, some rain
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Marina Bay': TrackInfo(
+            laps=62, base_time=115, wear_modifier=0.9,
+            weather_weights=[0.3, 0.3, 0.3, 0.08, 0.02],  # Singapore, tropical, rainy
+            condition_weights=[0.4, 0.4, 0.05, 0.15]
+        ),
+        'Yas Marina': TrackInfo(
+            laps=58, base_time=100, wear_modifier=0.85,
+            weather_weights=[0.9, 0.08, 0.0, 0.0, 0.02],  # Abu Dhabi, desert, very dry
+            condition_weights=[0.6, 0.25, 0.05, 0.1]
+        ),
+        'Miami': TrackInfo(
+            laps=57, base_time=95, wear_modifier=0.8,
+            weather_weights=[0.4, 0.3, 0.2, 0.08, 0.02],  # Florida, subtropical, some rain
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Circuit of the Americas': TrackInfo(
+            laps=56, base_time=100, wear_modifier=0.85,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Texas, variable weather
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Interlagos': TrackInfo(
+            laps=71, base_time=90, wear_modifier=0.8,
+            weather_weights=[0.4, 0.3, 0.2, 0.08, 0.02],  # Brazil, subtropical, rainy
+            condition_weights=[0.45, 0.35, 0.05, 0.15]
+        ),
+        'Hungaroring': TrackInfo(
+            laps=70, base_time=105, wear_modifier=0.9,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Hungary, temperate
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Red Bull Ring': TrackInfo(
+            laps=71, base_time=85, wear_modifier=0.8,
+            weather_weights=[0.4, 0.3, 0.2, 0.08, 0.02],  # Austria, alpine, some rain
+            condition_weights=[0.45, 0.35, 0.05, 0.15]
+        ),
+        'Zandvoort': TrackInfo(
+            laps=72, base_time=90, wear_modifier=0.85,
+            weather_weights=[0.35, 0.3, 0.25, 0.08, 0.02],  # Netherlands, coastal, rainy
+            condition_weights=[0.45, 0.35, 0.05, 0.15]
+        ),
+        'Barcelona': TrackInfo(
+            laps=66, base_time=95, wear_modifier=0.8,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Spain, Mediterranean
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Shanghai': TrackInfo(
+            laps=56, base_time=95, wear_modifier=0.85,
+            weather_weights=[0.4, 0.3, 0.2, 0.08, 0.02],  # China, temperate, some rain
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Baku': TrackInfo(
+            laps=51, base_time=100, wear_modifier=0.9,
+            weather_weights=[0.6, 0.3, 0.08, 0.02, 0.0],  # Azerbaijan, semi-arid
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        ),
+        'Las Vegas': TrackInfo(
+            laps=50, base_time=105, wear_modifier=0.85,
+            weather_weights=[0.85, 0.1, 0.0, 0.0, 0.05],  # Desert, very dry
+            condition_weights=[0.6, 0.25, 0.05, 0.1]
+        ),
+        'Circuit Gilles Villeneuve': TrackInfo(
+            laps=57, base_time=100, wear_modifier=0.9,
+            weather_weights=[0.9, 0.08, 0.0, 0.0, 0.02],  # Qatar, desert, very dry
+            condition_weights=[0.6, 0.25, 0.05, 0.1]
+        ),
+        'Mexico City': TrackInfo(
+            laps=71, base_time=95, wear_modifier=0.85,
+            weather_weights=[0.5, 0.3, 0.15, 0.05, 0.0],  # Mexico, temperate
+            condition_weights=[0.5, 0.35, 0.05, 0.1]
+        )
+    },
+    'CIRCUIT_IMAGES': {
+        'Bahrain': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Bahrain_Circuit.webp',
+        'Jeddah Corniche': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Saudi_Arabia_Circuit.webp',
+        'Albert Park': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Australia_Circuit.webp',
+        'Suzuka': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Japan_Circuit.webp',
+        'Shanghai': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/China_Circuit.webp',
+        'Miami': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Miami_Circuit.webp',
+        'Interlagos': 'https://formulapedia.com/wp-content/uploads/2023/01/Brazilian-Autodromo-Jose-Carlos-Pace-circuit-map.png',
+        'Imola': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Emilia_Romagna_Circuit.webp',
+        'Barcelona': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Spain_Circuit.webp',
+        'Monaco': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Monaco_Circuit.webp',
+        'Red Bull Ring': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Austria_Circuit.webp',
+        'Silverstone': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Great_Britain_Circuit.webp',
+        'Hungaroring': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Hungary_Circuit.webp',
+        'Spa-Francorchamps': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Belgium_Circuit.webp',
+        'Zandvoort': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Netherlands_Circuit.webp',
+        'Monza': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Italy_Circuit.webp',
+        'Baku': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Baku_Circuit.webp',
+        'Marina Bay': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Singapore_Circuit.webp',
+        'Circuit of the Americas': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/USA_Circuit.webp',
+        'Lusail International': 'https://formulapedia.com/wp-content/uploads/2023/01/Qatar-Losail-International-Circuit-map.png',
+        'Yas Marina': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Abu_Dhabi_Circuit.webp',
+        'Las Vegas': 'https://media.formula1.com/image/upload/c_fit,h_704/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Las_Vegas_Circuit.webp',
+        'Circuit Gilles Villeneuve': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Canada_Circuit.webp',
+        'Mexico City': 'https://media.formula1.com/image/upload/c_lfill,w_3392/q_auto/v1740000000/content/dam/fom-website/2018-redesign-assets/Circuit%20maps%2016x9/Mexico_Circuit.webp',
+    },
+    'DRIVER_CARDS': {
+        'Max Verstappen': {'season': 2024, 'base_attack': 90, 'base_defence': 88, 'rarity': 'Legendary'},
+        'Lando Norris': {'season': 2024, 'base_attack': 85, 'base_defence': 85, 'rarity': 'Epic'},
+        'Charles Leclerc': {'season': 2024, 'base_attack': 86, 'base_defence': 84, 'rarity': 'Epic'},
+        'Lewis Hamilton': {'season': 2024, 'base_attack': 88, 'base_defence': 87, 'rarity': 'Legendary'},
+        'Oscar Piastri': {'season': 2024, 'base_attack': 82, 'base_defence': 80, 'rarity': 'Rare'},
+        'Sergio Perez': {'season': 2024, 'base_attack': 80, 'base_defence': 78, 'rarity': 'Rare'},
+        'Fernando Alonso': {'season': 2024, 'base_attack': 83, 'base_defence': 85, 'rarity': 'Epic'},
+        'George Russell': {'season': 2024, 'base_attack': 81, 'base_defence': 80, 'rarity': 'Rare'},
+        'Ayrton Senna': {'season': 1990, 'base_attack': 92, 'base_defence': 90, 'rarity': 'Legendary'},
+        'Michael Schumacher': {'season': 2004, 'base_attack': 91, 'base_defence': 89, 'rarity': 'Legendary'}
+    },
+    'CAR_CARDS': {
+        'Red Bull RB20': {'year': 2024, 'base_attack': 90, 'base_defence': 88, 'rarity': 'Legendary'},
+        'McLaren MCL38': {'year': 2024, 'base_attack': 85, 'base_defence': 85, 'rarity': 'Epic'},
+        'Ferrari SF-24': {'year': 2024, 'base_attack': 86, 'base_defence': 84, 'rarity': 'Epic'},
+        'Mercedes W15': {'year': 2024, 'base_attack': 84, 'base_defence': 83, 'rarity': 'Epic'},
+        'Aston Martin AMR24': {'year': 2024, 'base_attack': 80, 'base_defence': 80, 'rarity': 'Rare'},
+        'McLaren MP4/4': {'year': 1988, 'base_attack': 90, 'base_defence': 87, 'rarity': 'Legendary'},
+        'Ferrari F2004': {'year': 2004, 'base_attack': 88, 'base_defence': 86, 'rarity': 'Legendary'},
+        'Williams FW14B': {'year': 1992, 'base_attack': 87, 'base_defence': 85, 'rarity': 'Epic'}
+    },
+    'RARITY_WEIGHTS': {
+        'Common': 0.5,
+        'Rare': 0.3,
+        'Epic': 0.15,
+        'Legendary': 0.05
+    },
+    'PACK_CONTENTS': {
+        'silver': {'Common': 0.6, 'Rare': 0.3, 'Epic': 0.09, 'Legendary': 0.01},
+        'gold': {'Common': 0.2, 'Rare': 0.4, 'Epic': 0.3, 'Legendary': 0.1}
+    }
+}
+
+# Global state
+class RaceState:
+    def __init__(self):
+        self.race_lobbies: Dict[int, dict] = {}
+        self.player_race_data: Dict[str, dict] = {}
+        self.lobbies_lock = Lock()
+        self.active_race: Optional[int] = None
+        self.current_race_players: set = set()
+        self.career_stats: Dict[str, dict] = {}
+        self.player_control_panels: Dict[str, int] = {}
+
+race_state = RaceState()
+
+def initialize_career_stats(pid: str) -> None:
+    race_state.career_stats.setdefault(pid, {})
+    defaults = {
+        'races_entered': 0, 'wins': 0, 'podiums': 0, 'dnfs': 0, 'fastest_lap': 0, 'points': 0,
+        'zcoins': 0, 'last_daily': 0, 'last_weekly': 0, 'last_monthly': 0,
+        'driver_cards': [], 'car_cards': [], 'selected_driver': None, 'selected_car': None,
+        'silver_packs': 0, 'gold_packs': 0
+    }
+    save_career_stats()
+    for key, value in defaults.items():
+        race_state.career_stats[pid].setdefault(key, value)
+
+def load_career_stats() -> None:
+    try:
+        if os.path.exists("career_stats.json"):
+            with open("career_stats.json", "r") as f:
+                data = json.load(f)
+                for pid in data:
+                    if 'silver_packs' in data[pid]:
+                        data[pid]['silver_packs'] = data[pid].pop('silver_packs')
+                    if 'premium_crates' in data[pid]:
+                        data[pid]['gold_packs'] = data[pid].pop('gold_packs')
+                race_state.career_stats = data
+                for pid in race_state.career_stats:
+                    initialize_career_stats(pid)
+                logger.info("Loaded career stats from career_stats.json")
+        else:
+            race_state.career_stats = {}
+            logger.info("No career stats file found, starting fresh")
+    except Exception as e:
+        logger.error(f"Failed to load career stats: {e}")
+        race_state.career_stats = {}
+
+def save_career_stats() -> None:
+    try:
+        with open("career_stats.json", "w") as f:
+            json.dump(race_state.career_stats, f, indent=4)
+        logger.info("Saved career stats to career_stats.json")
+    except Exception as e:
+        logger.error(f"Failed to save career stats: {e}")
+
+def generate_card(card_type: str, rarity: str = None) -> Card:
+    catalog = CONSTANTS['DRIVER_CARDS'] if card_type == 'driver' else CONSTANTS['CAR_CARDS']
+    if rarity:
+        available_cards = [(name, data) for name, data in catalog.items() if data['rarity'] == rarity]
+    else:
+        rarities = list(CONSTANTS['RARITY_WEIGHTS'].keys())
+        weights = list(CONSTANTS['RARITY_WEIGHTS'].values())
+        selected_rarity = random.choices(rarities, weights)[0]
+        available_cards = [(name, data) for name, data in catalog.items() if data['rarity'] == selected_rarity]
+    if not available_cards:
+        available_cards = [(name, data) for name, data in catalog.items()]
+    name, data = random.choice(available_cards)
+    attack = max(50, min(100, data['base_attack'] + random.randint(-5, 5)))
+    defence = max(50, min(100, data['base_defence'] + random.randint(-5, 5)))
+    return Card(
+        name=name,
+        season=data['season' if card_type == 'driver' else 'year'],
+        attack=attack,
+        defence=defence,
+        rarity=data['rarity'],
+        card_id=str(uuid.uuid4())[:8],
+        type=card_type
+    )
+
+def format_f1_time(seconds: float, mode: str = 'full') -> str:
+    if seconds == "DNF":
+        return "DNF"
+    if mode == 'seconds':
+        return f"+{seconds:.3f}" if seconds > 0 else "-"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours}:{minutes:02d}:{secs:06.3f}"
+
+def generate_weather_schedule(total_laps: int, track: str) -> List[Tuple[int, int, str]]:
+    if random.random() < 0.5:
+        weather = random.choices(CONSTANTS['WEATHER_TYPES'], CONSTANTS['TRACKS'][track].weather_weights)[0]
+        return [(1, total_laps, weather)]
+    num_segments = random.randint(2, 3)
+    segment_length = total_laps // num_segments
+    schedule = []
+    last_weather = None
+    current_lap = 1
+    for i in range(num_segments):
+        start_lap = current_lap
+        end_lap = min(current_lap + segment_length - 1, total_laps) if i < num_segments - 1 else total_laps
+        available_weathers = [w for w in CONSTANTS['WEATHER_TYPES'] if w != last_weather]
+        available_weights = CONSTANTS['TRACKS'][track].weather_weights[:len(available_weathers)]
+        weather = random.choices(available_weathers, available_weights)[0]
+        schedule.append((start_lap, end_lap, weather))
+        last_weather = weather
+        current_lap = end_lap + 1
+    return schedule
+
+async def check_dnf(pid: str, weather: str, track_condition: str) -> bool:
+    data = race_state.player_race_data[pid]
+    if data['dnf']:
+        return False
+    stats = race_state.career_stats[pid]
+    driver = next((c for c in stats['driver_cards'] if c['card_id'] == stats['selected_driver']), None)
+    car = next((c for c in stats['car_cards'] if c['card_id'] == stats['selected_car']), None)
+    defence = (driver['defence'] + car['defence']) / 2 if driver and car else 75
+    base_dnf_chance = 0.01 * (100 - defence) / 50
+    weather_dnf = {'Sunny': 0, 'Cloudy': 0, 'Light Rain': 0.02, 'Heavy Rain': 0.05, 'Foggy': 0.03}
+    condition_dnf = {'High Grip': -0.02, 'Low Grip': 0.02, 'Oil Spill': 0.05, 'High Downforce': 0.02}
+    dnf_chance = min(base_dnf_chance + weather_dnf[weather] + condition_dnf[track_condition], 0.08)
+    if data['current_tyre_wear'] >= 1.0:
+        data['dnf'] = True
+        data['dnf_reason'] = 'Tyre Wear'
+        return True
+    elif random.random() < dnf_chance:
+        data['dnf'] = True
+        data['dnf_reason'] = random.choice(['Mechanical Failure', 'Spin', 'Collision'])
+        return True
+    return False
+
+class DriverControlPanel(View):
+    def __init__(self, player_id: str, channel_id: int):
+        super().__init__(timeout=None)
+        self.player_id = player_id
+        self.channel_id = channel_id
+
+    async def send_or_update_panel(self, user: discord.User, current_lap: int):
+        lobby_data = race_state.race_lobbies[self.channel_id]
+        track = lobby_data['track']
+        total_laps = CONSTANTS['TRACKS'][track].laps
+        weather_schedule = lobby_data['weather_schedule']
+        current_weather = next((w for s, e, w in weather_schedule if s <= current_lap <= e), "Unknown")
+        
+        embed = discord.Embed(
+            title="🏎️ Driver Control Panel",
+            description=f"🏁 **{track}** – Lap {current_lap}/{total_laps}\n"
+                        f"**Weather**: {CONSTANTS['WEATHER_EMOJI'][current_weather]} {current_weather}",
+            color=0x00ff00
+        )
+        
+        data = race_state.player_race_data.get(self.player_id, {})
+        if data.get('dnf'):
+            embed.add_field(
+                name="Your Status",
+                value=f"**DNF** - Reason: {data['dnf_reason']}",
+                inline=False
+            )
+        else:
+            # Calculate position, gap to leader, and interval
+            standings = [(pid, race_state.player_race_data[pid]['total_time'] if not race_state.player_race_data[pid]['dnf'] else "DNF",
+                         race_state.player_race_data[pid]['laps_completed'] if not race_state.player_race_data[pid]['dnf'] else "DNF")
+                        for pid in race_state.current_race_players]
+            standings.sort(key=lambda x: (x[1] if x[1] != "DNF" else float('inf'), -x[2] if x[2] != "DNF" else -float('inf')))
+            position = next((i + 1 for i, (pid, _, _) in enumerate(standings) if pid == self.player_id), "N/A")
+            leader_time = next((t for _, t, _ in standings if t != "DNF"), None)
+            gap = "-" if position == 1 else format_f1_time(data['total_time'] - leader_time, mode='seconds') if leader_time is not None else "N/A"
+            interval = "-"
+            if position > 1:
+                for i, (pid, t, _) in enumerate(standings):
+                    if pid == self.player_id and i > 0:
+                        prev_time = standings[i-1][1]
+                        if prev_time != "DNF":
+                            interval = format_f1_time(data['total_time'] - prev_time, mode='seconds')
+            
+            wear_percent = min(int(data['current_tyre_wear'] * 100), 100)
+            pits = sum(1 for lap in range(1, current_lap + 1) if data.get('last_pit_lap') == lap)
+            
+            embed.add_field(
+                name="Your Status",
+                value=(
+                    f"**Position**: {position}\n"
+                    f"**Gap**: {gap}\n"
+                    f"**Interval**: {interval}\n"
+                    f"**Tyre**: {CONSTANTS['TYRE_EMOJI'][data['current_tyre']]} {data['current_tyre'].capitalize()}\n"
+                    f"**Tyre Wear**: {100 - wear_percent}%\n"
+                    f"**Stint**: {data['stint_laps']} laps\n"
+                    f"**Pits**: {pits}\n"
+                    f"**Strategy**: {data.get('strategy', 'N/A').capitalize()}"
+                ),
+                inline=True
+            )
+            embed.add_field(
+                name="Tyres Left",
+                value=f"{CONSTANTS['TYRE_EMOJI']['soft']}: {data['tyres']['soft']}, "
+                      f"{CONSTANTS['TYRE_EMOJI']['medium']}: {data['tyres']['medium']}, "
+                      f"{CONSTANTS['TYRE_EMOJI']['hard']}: {data['tyres']['hard']}, "
+                      f"{CONSTANTS['TYRE_EMOJI']['intermediate']}: {data['tyres']['intermediate']}, "
+                      f"{CONSTANTS['TYRE_EMOJI']['wet']}: {data['tyres']['wet']}",
+                inline=True
+            )
+        
+        if self.player_id in race_state.player_control_panels:
+            try:
+                message = await user.fetch_message(race_state.player_control_panels[self.player_id])
+                await message.edit(embed=embed, view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                message = await user.send(embed=embed, view=self)
+                race_state.player_control_panels[self.player_id] = message.id
+        else:
+            message = await user.send(embed=embed, view=self)
+            race_state.player_control_panels[self.player_id] = message.id
+
+    @discord.ui.button(label="Box, Box! (Pit)", style=discord.ButtonStyle.red, custom_id="pit_button")
+    async def pit_button(self, interaction: Interaction, button: Button):
+        if str(interaction.user.id) != self.player_id:
+            await interaction.response.send_message("This is not your control panel!", ephemeral=True)
+            return
+        async with race_state.lobbies_lock:
+            if not race_state.active_race or self.channel_id != race_state.active_race:
+                await interaction.response.send_message("No active race or wrong channel!", ephemeral=True)
+                return
+            data = race_state.player_race_data.get(self.player_id)
+            if not data or data['dnf']:
+                await interaction.response.send_message("You already DNF'd and cannot pit!", ephemeral=True)
+                return
+            current_weather = None
+            current_lap = max(data['laps_completed'], 1)
+            for start, end, weather in race_state.race_lobbies[self.channel_id]['weather_schedule']:
+                if start <= current_lap <= end:
+                    current_weather = weather
+                    break
+            options = [
+                SelectOption(label=tyre.capitalize(), value=tyre, emoji=CONSTANTS['TYRE_EMOJI'][tyre])
+                for tyre in CONSTANTS['TYRE_SPEED'].keys()
+                if data['tyres'][tyre] > 0 and
+                (tyre not in ['intermediate', 'wet'] or current_weather in ['Light Rain', 'Heavy Rain']) and
+                (tyre != 'wet' or current_weather == 'Heavy Rain')
+            ]
+            if not options:
+                await interaction.response.send_message("No valid tyres available for current conditions!", ephemeral=True)
+                return
+            select = discord.ui.Select(placeholder="Select tyre type...", options=options, custom_id="pit_tyre_select")
+            async def select_callback(interaction: Interaction):
+                tyre_type = interaction.data['values'][0]
+                async with race_state.lobbies_lock:
+                    base_pit_time = random.uniform(20, 25)
+                    weather_pit_modifier = {'Sunny': 0, 'Cloudy': 0, 'Light Rain': 2, 'Heavy Rain': 5, 'Foggy': 1}[current_weather]
+                    condition_pit_modifier = {'High Grip': 0, 'Low Grip': 0, 'Oil Spill': 2, 'High Downforce': 0}[
+                        race_state.race_lobbies[self.channel_id]['track_condition']
+                    ]
+                    pit_time = base_pit_time + weather_pit_modifier + condition_pit_modifier
+                    old_tyre = data['current_tyre']
+                    data['current_tyre'] = tyre_type
+                    data['current_tyre_wear'] = 0
+                    data['stint_laps'] = 0
+                    data['tyres'][tyre_type] -= 1
+                    data['total_time'] += pit_time
+                    data['last_pit_lap'] = current_lap
+                    logger.info(f"User {self.player_id} pitted from {old_tyre} to {tyre_type}, wear reset, +{pit_time:.2f}s")
+                    await interaction.response.send_message(
+                        f"Box, box! Pitted to {CONSTANTS['TYRE_EMOJI'][tyre_type]} {tyre_type.upper()} tyres! (+{pit_time:.2f}s)",
+                        ephemeral=True
+                    )
+                    await self.send_or_update_panel(interaction.user, current_lap)
+            select.callback = select_callback
+            view = View()
+            view.add_item(select)
+            await interaction.response.send_message("Choose your tyre:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Change Strategy", style=discord.ButtonStyle.blurple, custom_id="strategy_button")
+    async def strategy_button(self, interaction: Interaction, button: Button):
+        if str(interaction.user.id) != self.player_id:
+            await interaction.response.send_message("This is not your control panel!", ephemeral=True)
+            return
+        async with race_state.lobbies_lock:
+            if not race_state.active_race or self.channel_id != race_state.active_race:
+                await interaction.response.send_message("No active race or wrong channel!", ephemeral=True)
+                return
+            data = race_state.player_race_data.get(self.player_id)
+            if not data or data['dnf']:
+                await interaction.response.send_message("You already DNF'd and cannot change strategy!", ephemeral=True)
+                return
+            options = [
+                SelectOption(label=strategy.capitalize(), value=strategy)
+                for strategy in CONSTANTS['STRATEGY_MODIFIER'].keys()
+            ]
+            select = discord.ui.Select(placeholder="Select strategy...", options=options, custom_id="strategy_select")
+            async def select_callback(interaction: Interaction):
+                strategy_type = interaction.data['values'][0]
+                data['strategy'] = strategy_type
+                await interaction.response.send_message(f"Strategy updated to {strategy_type.capitalize()}!", ephemeral=True)
+                current_lap = max(data['laps_completed'], 1)
+                await self.send_or_update_panel(interaction.user, current_lap)
+            select.callback = select_callback
+            view = View()
+            view.add_item(select)
+            await interaction.response.send_message("Choose your strategy:", view=view, ephemeral=True)
+
+async def simulate_race(channel: discord.TextChannel, lobby_players_list: List[str]):
+    channel_id = channel.id
+    track = race_state.race_lobbies[channel_id]['track']
+    weather_schedule = race_state.race_lobbies[channel_id]['weather_schedule']
+    track_condition = race_state.race_lobbies[channel_id]['track_condition']
+    podium_rewards = race_state.race_lobbies[channel_id].get('podium_rewards', False)
+    condition_modifiers = {
+        'High Grip': {'time': 0.98, 'wear': 0.9},
+        'Low Grip': {'time': 1.03, 'wear': 1.05},
+        'Oil Spill': {'time': 1.05, 'wear': 1.1},
+        'High Downforce': {'time': None, 'wear': 1.05}
+    }
+    condition_wear_modifier = condition_modifiers[track_condition]['wear']
+
+    lights_message = await channel.send(embed=discord.Embed(title=f"🏎️ {track} Grand Prix - Starting Grid", description="Preparing for lights out...", color=0xff0000))
+    await asyncio.sleep(1)
+    for light in range(1, 6):
+        embed = discord.Embed(title=f"🏎️ {track} Grand Prix - Lights Out", description=f"🔴 " * light + "⚫ " * (5 - light), color=0xff0000)
+        await lights_message.edit(embed=embed)
+        await asyncio.sleep(1 if light < 5 else 2)  # 1s per light, 2s pause before start
+    await lights_message.edit(embed=discord.Embed(title=f"🏎️ {track} Grand Prix - Lights Out", description="⚫ ⚫ ⚫ ⚫ ⚫\n**RACE START!**", color=0x00ff00))
+
+    race_message = await channel.send(embed=discord.Embed(
+        title=f"🏎️ Race - {track} ({CONSTANTS['WEATHER_EMOJI'][weather_schedule[0][2]]} {weather_schedule[0][2]}, {track_condition})",
+        description="Race starting... Check your DMs for the Driver Control Panel!", color=0x00ff00
+    ))
+    standings = [(pid, 0.0, 0) for pid in lobby_players_list]
+    safety_car = False
+    safety_car_laps = 0
+    current_weather = weather_schedule[0][2]
+    time_modifier = {'Sunny': 1.0, 'Cloudy': 1.02, 'Light Rain': 1.05, 'Heavy Rain': 1.08, 'Foggy': 1.04}[current_weather]
+    wear_modifier = {'Sunny': 1.0, 'Cloudy': 1.02, 'Light Rain': 1.05, 'Heavy Rain': 1.08, 'Foggy': 1.04}[current_weather]
+    fastest_lap_time = float('inf')
+    fastest_lap_player = None
+
+    for pid in lobby_players_list:
+        if not pid.startswith('AI_'):
+            try:
+                user = await bot.fetch_user(int(pid))
+                panel = DriverControlPanel(pid, channel_id)
+                await panel.send_or_update_panel(user, 1)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                logger.error(f"Failed to send control panel to user ID {pid}: {e}")
+                await channel.send(f"⚠️ Failed to send Driver Control Panel to user ID {pid}: {str(e)}")
+
+    for lap in range(1, CONSTANTS['TRACKS'][track].laps + 1):
+        for start, end, weather in weather_schedule:
+            if start <= lap <= end and weather != current_weather:
+                current_weather = weather
+                time_modifier = {'Sunny': 1.0, 'Cloudy': 1.02, 'Light Rain': 1.05, 'Heavy Rain': 1.08, 'Foggy': 1.04}[current_weather]
+                wear_modifier = {'Sunny': 1.0, 'Cloudy': 1.02, 'Light Rain': 1.05, 'Heavy Rain': 1.08, 'Foggy': 1.04}[current_weather]
+                await channel.send(f"Weather change: {CONSTANTS['WEATHER_EMOJI'][current_weather]} {current_weather} starting lap {lap}!")
+                for pid in lobby_players_list:
+                    if not pid.startswith('AI_'):
+                        try:
+                            user = await bot.fetch_user(int(pid))
+                            panel = DriverControlPanel(pid, channel_id)
+                            await panel.send_or_update_panel(user, lap)
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            continue
+                break
+
+        lap_fastest_time = float('inf')
+        lap_fastest_player = None
+        for i, (pid, _, laps) in enumerate(standings):
+            data = race_state.player_race_data.get(pid)
+            if not data or pid not in race_state.current_race_players or data['dnf']:
+                continue
+            dnf_triggered = await check_dnf(pid, current_weather, track_condition)
+            if dnf_triggered:
+                await channel.send(f"<@{pid}> DNFs due to {data['dnf_reason']}!" if not pid.startswith('AI_') else f"{pid[3:]} DNFs due to {data['dnf_reason']}!")
+                race_state.career_stats[pid]['dnfs'] += 1
+                if not safety_car:
+                    safety_car = True
+                    safety_car_laps = 1
+                    await channel.send(f"🚨 **Safety Car Deployed for {safety_car_laps} lap!** Incident on track.")
+                    time_modifier *= 1.1
+                if not pid.startswith('AI_'):
+                    try:
+                        user = await bot.fetch_user(int(pid))
+                        await user.send(embed=discord.Embed(
+                            title="🏎️ Your Race Ended!",
+                            description=f"✦ Your car suffered a {data['dnf_reason'].lower()} on Lap {lap}. ✦",
+                            color=discord.Color.red()
+                        ))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        logger.warning(f"Failed to send DNF DM to user ID {pid}")
+                continue
+            if i > 0 and random.random() < 0.02:
+                prev_pid, prev_time, _ = standings[i-1]
+                if prev_time != "DNF" and data['total_time'] - prev_time < 1.0:
+                    time_penalty = random.uniform(2, 5)
+                    race_state.player_race_data[pid]['total_time'] += time_penalty
+                    race_state.player_race_data[prev_pid]['total_time'] += time_penalty
+                    if random.random() < 0.01:
+                        race_state.player_race_data[pid]['dnf'] = True
+                        race_state.player_race_data[pid]['dnf_reason'] = 'Collision'
+                        race_state.career_stats[pid]['dnfs'] += 1
+                        await channel.send(f"<@{pid}> DNFs due to collision!" if not pid.startswith('AI_') else f"{pid[3:]} DNFs due to collision!")
+                        if not pid.startswith('AI_'):
+                            try:
+                                user = await bot.fetch_user(int(pid))
+                                await user.send(embed=discord.Embed(
+                                    title="🏎️ Your Race Ended!",
+                                    description=f"✦ Your car suffered a collision on Lap {lap}. ✦",
+                                    color=discord.Color.red()
+                                ))
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                logger.warning(f"Failed to send collision DM to user ID {pid}")
+                        if not safety_car:
+                            safety_car = True
+                            safety_car_laps = 1
+                            await channel.send(f"🚨 **Safety Car Deployed for {safety_car_laps} lap!** Incident on track.")
+                            time_modifier *= 1.1
+                    if random.random() < 0.01:
+                        race_state.player_race_data[prev_pid]['dnf'] = True
+                        race_state.player_race_data[prev_pid]['dnf_reason'] = 'Collision'
+                        race_state.career_stats[prev_pid]['dnfs'] += 1
+                        await channel.send(f"<@{prev_pid}> DNFs due to collision!" if not prev_pid.startswith('AI_') else f"{prev_pid[3:]} DNFs due to collision!")
+                        if not prev_pid.startswith('AI_'):
+                            try:
+                                user = await bot.fetch_user(int(prev_pid))
+                                await user.send(embed=discord.Embed(
+                                    title="🏎️ Your Race Ended!",
+                                    description=f"✦ Your car suffered a collision on Lap {lap}. ✦",
+                                    color=discord.Color.red()
+                                ))
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                logger.warning(f"Failed to send collision DM to user ID {prev_pid}")
+                        if not safety_car:
+                            safety_car = True
+                            safety_car_laps = 1
+                            await channel.send(f"🚨 **Safety Car Deployed for {safety_car_laps} lap!** Incident on track.")
+                            time_modifier *= 1.1
+                    await channel.send(f"Collision! {'<@' + pid + '>' if not pid.startswith('AI_') else pid[3:]} and {'<@' + prev_pid + '>' if not prev_pid.startswith('AI_') else prev_pid[3:]} lose {time_penalty:.2f}s!")
+            
+            if data['laps_completed'] < lap:
+                tyre = data['current_tyre']
+                tyre_speed = CONSTANTS['TYRE_SPEED'][tyre]
+                if current_weather in ['Light Rain', 'Heavy Rain'] and tyre == 'intermediate':
+                    tyre_speed = 0.98
+                elif current_weather == 'Heavy Rain' and tyre == 'wet':
+                    tyre_speed = 0.97
+                condition_time_modifier = condition_modifiers[track_condition]['time'] if condition_modifiers[track_condition]['time'] is not None else (
+                    1.02 if data['strategy'] == 'save' and track_condition == 'High Downforce' else 1.0
+                )
+                stats = race_state.career_stats[pid]
+                driver = next((c for c in stats['driver_cards'] if c['card_id'] == stats['selected_driver']), None)
+                car = next((c for c in stats['car_cards'] if c['card_id'] == stats['selected_car']), None)
+                attack = (driver['attack'] + car['attack']) / 2 if driver and car else 75
+                base_time = random.uniform(80, 90) * time_modifier * condition_time_modifier * (0.98 + random.random() * 0.04)
+                attack_modifier = (100 - attack) / 100 + 0.5
+                lap_time = base_time * tyre_speed * CONSTANTS['STRATEGY_MODIFIER'][data['strategy']] * attack_modifier
+                data['total_time'] += lap_time
+                data['last_lap_time'] = lap_time
+                if lap_time < lap_fastest_time:
+                    lap_fastest_time = lap_time
+                    lap_fastest_player = pid
+                data['laps_completed'] += 1
+                just_pitted = data.get('last_pit_lap') == lap
+                if not just_pitted:
+                    tyre_wear = CONSTANTS['TYRE_WEAR'][tyre] * CONSTANTS['STRATEGY_WEAR'][data['strategy']] * wear_modifier * condition_wear_modifier
+                    if current_weather == "Light Rain":
+                        if tyre == "intermediate":
+                            tyre_wear *= 0.85
+                        elif tyre == "wet":
+                            tyre_wear *= 1.15
+                    elif current_weather == "Heavy Rain":
+                        if tyre == "intermediate":
+                            tyre_wear *= 1.10
+                        elif tyre == "wet":
+                            tyre_wear *= 0.75
+                    else:
+                        if tyre == "wet":
+                            tyre_wear *= 1.6
+                        elif tyre == "intermediate":
+                            tyre_wear *= 1.3
+                    data['current_tyre_wear'] = min(data['current_tyre_wear'] + tyre_wear, 1.0)
+                else:
+                    data['current_tyre_wear'] = 0.0
+                    logger.debug(f"🛞 Skipping tyre degradation for {pid} on lap {lap} due to pit stop")
+                data['stint_laps'] += 1
+                if not pid.startswith('AI_'):
+                    try:
+                        user = await bot.fetch_user(int(pid))
+                        panel = DriverControlPanel(pid, channel_id)
+                        await panel.send_or_update_panel(user, lap)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        continue
+
+        if lap_fastest_time < fastest_lap_time:
+            fastest_lap_time = lap_fastest_time
+            fastest_lap_player = lap_fastest_player
+
+        standings = [(pid, race_state.player_race_data[pid]['total_time'] if not race_state.player_race_data[pid]['dnf'] else "DNF",
+                     race_state.player_race_data[pid]['laps_completed'] if not race_state.player_race_data[pid]['dnf'] else "DNF")
+                    for pid in lobby_players_list]
+        standings.sort(key=lambda x: (x[1] if x[1] != "DNF" else float('inf'), -x[2] if x[2] != "DNF" else -float('inf')))
+        description = f"""**Weather**: {CONSTANTS['WEATHER_EMOJI'][current_weather]} {current_weather} • Lap: {lap}/{CONSTANTS['TRACKS'][track].laps}
+**Safety Car**: {'Active (' + str(safety_car_laps) + ' lap remaining)' if safety_car else 'Inactive'}\n\n"""
+        leader_time = None
+        prev_time = None
+        for i, (pid, time, laps) in enumerate(standings):
+            if time == "DNF":
+                continue
+            if leader_time is None:
+                leader_time = time
+            gap = "-" if i == 0 else format_f1_time(time - leader_time, mode='seconds')
+            interval = "-" if i == 0 else format_f1_time(time - prev_time, mode='seconds') if prev_time is not None else "-"
+            tyre = race_state.player_race_data[pid]['current_tyre']
+            display_name = pid[3:] if not pid.startswith('AI_') else pid[3:]
+            description += f"**P{i+1}** • ``{display_name:<12}`` • ``{gap:>9}`` • ``{interval:>9}`` • {CONSTANTS['TYRE_EMOJI'][tyre]} {race_state.player_race_data[pid]['stint_laps']:02d} ``-``\n"
+            prev_time = time
+        embed = discord.Embed(title=f"🏎️ **{track}** Grand Prix", description=description, color=0x00ff00)
+        await race_message.edit(embed=embed)
+
+        if safety_car:
+            safety_car_laps -= 1
+            if safety_car_laps <= 0:
+                safety_car = False
+                time_modifier /= 1.1
+                await channel.send("🚦 **Safety Car In!** Racing resumes.")
+        await asyncio.sleep(3.5)
+
+    results = [(pid, data['total_time']) for pid, data in race_state.player_race_data.items()
+              if pid in race_state.current_race_players and not data['dnf'] and data['laps_completed'] >= CONSTANTS['TRACKS'][track].laps]
+    results.sort(key=lambda x: x[1])
+    dnfs = [(pid, data['laps_completed'], data['total_time'], data['dnf_reason']) for pid, data in race_state.player_race_data.items()
+            if pid in race_state.current_race_players and (data['dnf'] or data['laps_completed'] < CONSTANTS['TRACKS'][track].laps)]
+    dnfs.sort(key=lambda x: (-x[1], x[2]))
+    async with race_state.lobbies_lock:
+        zcoin_rewards = {0: 300, 1: 200, 2: 100} if podium_rewards else {}
+        for i, (pid, _) in enumerate(results):
+            points = CONSTANTS['F1_POINTS'][i] if i < len(CONSTANTS['F1_POINTS']) else 0
+            race_state.career_stats[pid]['points'] += points
+            if i == 0:
+                race_state.career_stats[pid]['wins'] += 1
+            if i < 3:
+                race_state.career_stats[pid]['podiums'] += 1
+            if i in zcoin_rewards:
+                race_state.career_stats[pid]['zcoins'] += zcoin_rewards[i]
+            race_state.player_race_data[pid]['position'] = i + 1
+        if fastest_lap_player:
+            race_state.career_stats[fastest_lap_player]['fastest_lap'] += 1
+        description = f"**Weather**: {CONSTANTS['WEATHER_EMOJI'][current_weather]} {current_weather}\n\n"
+        if fastest_lap_player:
+            display_name = f"<@{fastest_lap_player}>" if not fastest_lap_player.startswith('AI_') else fastest_lap_player[3:]
+            description += f"**Fastest Lap**: {display_name} • ``{format_f1_time(fastest_lap_time, mode='full')}``\n\n"
+        description += "**Individual Results**\n"
+        leader_time = None
+        position = 0
+        for pid, total_time in results:
+            position += 1
+            data = race_state.player_race_data[pid]
+            points = CONSTANTS['F1_POINTS'][position-1] if position-1 < len(CONSTANTS['F1_POINTS']) else 0
+            formatted_time = format_f1_time(total_time, mode='full')
+            gap = "-" if leader_time is None else format_f1_time(total_time - leader_time, mode='seconds')
+            zcoin_text = f"<:ZCoin:1382982386471669820> +{zcoin_rewards[position-1]}" if position-1 in zcoin_rewards else "-"
+            display_name = pid[3:] if not pid.startswith('AI_') else pid[3:]
+            description += f"**P{position}** • ``{display_name:<20}`` • ``{formatted_time:<12}`` • ``{gap:<12}`` • {points:<3}Pts • {zcoin_text}\n"
+            if leader_time is None:
+                leader_time = total_time
+        for pid, _, _, dnf_reason in dnfs:
+            display_name = f"<@{pid}>" if not pid.startswith('AI_') else pid[3:]
+            description += f"• ``{display_name:<20}`` • ``DNF`` • **{dnf_reason:<12}** •\n"
+        mode = race_state.race_lobbies[channel_id]['mode']
+        if mode == 'duo' and race_state.race_lobbies[channel_id]['teams']:
+            description += "\n**Team Results**\n"
+            team_points = []
+            for team_id, players in race_state.race_lobbies[channel_id]['teams'].items():
+                total_points = sum(CONSTANTS['F1_POINTS'][race_state.player_race_data[p]['position']-1] 
+                                  if not race_state.player_race_data[p]['dnf'] and 
+                                  race_state.player_race_data[p]['laps_completed'] >= CONSTANTS['TRACKS'][track].laps and 
+                                  race_state.player_race_data[p]['position']-1 < len(CONSTANTS['F1_POINTS']) else 0 
+                                  for p in players)
+                team_points.append((team_id, total_points, players))
+            team_points.sort(key=lambda x: x[1], reverse=True)
+            for team_id, total_points, players in team_points:
+                team_name = race_state.race_lobbies[channel_id]['team_names'].get(team_id, f'Team {team_id}')
+                display_players = [f"<@{p}>" if not p.startswith('AI_') else p[3:] for p in players]
+                description += f"{team_name}: {', '.join(display_players)} • {total_points} points\n"
+        save_career_stats()
+    embed = discord.Embed(title=f"🏁 Final Results - {track} Grand Prix", description=description, color=0xf1c40f)
+    await channel.send(embed=embed)
+    race_state.player_control_panels.clear()
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    print("Syncing commands...")
+    await bot.tree.sync()
+    load_career_stats()
+    print("Commands synced!")
+
+@bot.tree.command(name="create", description="Create a race lobby in this channel.")
+@app_commands.describe(track="The track to race on (optional)")
+async def create(interaction: discord.Interaction, track: Optional[str] = None):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id in race_state.race_lobbies:
+            await interaction.response.send_message(
+                embed=discord.Embed(title="Error", description="A race lobby already exists in this channel.", color=0xff0000),
+                ephemeral=True
+            )
+            return
+        selected_track = track if track in CONSTANTS['TRACKS'] else random.choice(list(CONSTANTS['TRACKS'].keys()))
+        track_condition = random.choices(CONSTANTS['TRACK_CONDITIONS'], CONSTANTS['TRACKS'][selected_track].condition_weights)[0]
+        weather_schedule = generate_weather_schedule(CONSTANTS['TRACKS'][selected_track].laps, selected_track)
+        race_state.race_lobbies[channel_id] = {
+            'players': [str(interaction.user.id)],
+            'track': selected_track,
+            'host': str(interaction.user.id),
+            'weather_schedule': weather_schedule,
+            'track_condition': track_condition,
+            'mode': 'solo',
+            'teams': {},
+            'team_names': {}
+        }
+        user_id = str(interaction.user.id)
+        race_state.player_race_data[user_id] = {
+            'tyres': CONSTANTS['DEFAULT_TYRES'].copy(),
+            'initial_tyre': None,
+            'strategy': None,
+            'current_tyre': None,
+            'current_tyre_wear': 0,
+            'stint_laps': 0,
+            'laps_completed': 0,
+            'total_time': 0.0,
+            'last_lap_time': 0.0,
+            'dnf': False,
+            'dnf_reason': None,
+            'last_pit_lap': 0
+        }
+        initialize_career_stats(user_id)
+        if not race_state.career_stats[user_id]['driver_cards']:
+            card = generate_card('driver', 'Common')
+            race_state.career_stats[user_id]['driver_cards'].append(card.__dict__)
+            race_state.career_stats[user_id]['selected_driver'] = card.card_id
+        if not race_state.career_stats[user_id]['car_cards']:
+            card = generate_card('car', 'Common')
+            race_state.career_stats[user_id]['car_cards'].append(card.__dict__)
+            race_state.career_stats[user_id]['selected_car'] = card.card_id
+        save_career_stats()
+        weather_desc = "\n".join([f"{CONSTANTS['WEATHER_EMOJI'][weather]} {weather}: Laps {start}-{end}" 
+                                 for start, end, weather in weather_schedule])
+        embed = discord.Embed(
+            title="Race Lobby Created",
+            description=f"🏁 Race lobby created on **{selected_track}**\n"
+                       f"**Track condition**: {track_condition}\n"
+                       f"**Laps**: {CONSTANTS['TRACKS'][selected_track].laps}\n\n"
+                       f"**Weather schedule**:\n{weather_desc}\n"
+                       f"{interaction.user.mention} has joined as host.",
+            color=0x00ff00
+        )
+        # Add circuit image from URL
+        image_url = CONSTANTS['CIRCUIT_IMAGES'].get(selected_track)
+        if image_url:
+            embed.set_image(url=image_url)
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="join", description="Join the race lobby in this channel.")
+async def join(interaction: discord.Interaction):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby exists in this channel.", ephemeral=True)
+            return
+        user_id = str(interaction.user.id)
+        if user_id in race_state.race_lobbies[channel_id]['players']:
+            await interaction.response.send_message("You are already in this lobby.", ephemeral=True)
+            return
+        race_state.race_lobbies[channel_id]['players'].append(user_id)
+        race_state.player_race_data[user_id] = {
+            'tyres': CONSTANTS['DEFAULT_TYRES'].copy(),
+            'initial_tyre': None,
+            'strategy': None,
+            'current_tyre': None,
+            'current_tyre_wear': 0,
+            'stint_laps': 0,
+            'laps_completed': 0,
+            'total_time': 0.0,
+            'last_lap_time': 0.0,
+            'dnf': False,
+            'dnf_reason': None,
+            'last_pit_lap': 0
+        }
+        initialize_career_stats(user_id)
+        if not race_state.career_stats[user_id]['driver_cards']:
+            card = generate_card('driver', 'Common')
+            race_state.career_stats[user_id]['driver_cards'].append(card.__dict__)
+            race_state.career_stats[user_id]['selected_driver'] = card.card_id
+        if not race_state.career_stats[user_id]['car_cards']:
+            card = generate_card('car', 'Common')
+            race_state.career_stats[user_id]['car_cards'].append(card.__dict__)
+            race_state.career_stats[user_id]['selected_car'] = card.card_id
+        save_career_stats()
+        await interaction.response.send_message(f"{interaction.user.mention} has joined the race lobby!")
+
+@bot.tree.command(name="lobby", description="View the current race lobby.")
+async def lobby(interaction: discord.Interaction):
+    channel_id = interaction.channel.id
+    if channel_id not in race_state.race_lobbies:
+        await interaction.response.send_message("No race lobby in this channel.", ephemeral=True)
+        return
+    lobby_data = race_state.race_lobbies[channel_id]
+    weather_desc = "\n".join([f"{CONSTANTS['WEATHER_EMOJI'][weather]} {weather}: Laps {start}-{end}" 
+                             for start, end, weather in lobby_data['weather_schedule']])
+    description = (f"🏁 Race lobby - **{lobby_data['track']}**\n"
+                  f"**Track condition**: {lobby_data['track_condition']}\n"
+                  f"**Laps**: {CONSTANTS['TRACKS'][lobby_data['track']].laps}\n"
+                  f"**Mode**: {lobby_data['mode'].capitalize()}\n\n"
+                  f"**Weather schedule**:\n{weather_desc}\n\n"
+                  f"**Host**: <@{lobby_data['host']}>\n")
+    
+    if lobby_data['mode'] == 'duo' and lobby_data['teams']:
+        team_desc = "\n".join([
+            f"{lobby_data['team_names'].get(team_id, f'Team {team_id}')} : " +
+            ", ".join([
+                f"{'<@' + p + '>' if not p.startswith('AI_') else p[3:]} (" +
+                (f"{CONSTANTS['TYRE_EMOJI'][race_state.player_race_data[p]['initial_tyre']]} {race_state.player_race_data[p]['strategy'].capitalize()}"
+                 if p in race_state.player_race_data and race_state.player_race_data[p]['initial_tyre'] and race_state.player_race_data[p]['strategy']
+                 else '⏳ Pending') + ")"
+                for p in players
+            ])
+            for team_id, players in lobby_data['teams'].items()
+        ])
+        description += f"\n**Teams**:\n{team_desc}"
+    else:
+        player_desc = "\n".join([
+            f"{'<@' + player + '>' if not player.startswith('AI_') else player[3:]} (" +
+            (f"{CONSTANTS['TYRE_EMOJI'][race_state.player_race_data[player]['initial_tyre']]} {race_state.player_race_data[player]['strategy'].capitalize()}"
+             if player in race_state.player_race_data and race_state.player_race_data[player]['initial_tyre'] and race_state.player_race_data[player]['strategy']
+             else '⏳ Pending') + ")"
+            for player in lobby_data['players']
+        ])
+        description += f"\n**Players**:\n{player_desc}"
+    
+    embed = discord.Embed(title="🏎️ Race Lobby", description=description, color=0x00ff00)
+    # Add grid image
+    grid_image_url = 'https://www.pitpass.com/images/races/800/2020russiasunday01.jpg'
+    embed.set_image(url=grid_image_url)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="setup", description="Set your initial tyre and strategy for the race.")
+@app_commands.describe(
+    tyre="Initial tyre type: soft, medium, hard, intermediate, wet",
+    strategy="Race strategy: push, balanced, save"
+)
+async def setup(interaction: discord.Interaction, tyre: str, strategy: str):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby in this channel.", ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message("Cannot set tyre and strategy during an active race!", ephemeral=True)
+            return
+        user_id = str(interaction.user.id)
+        if user_id not in race_state.race_lobbies[channel_id]['players']:
+            await interaction.response.send_message("You are not in the race lobby!", ephemeral=True)
+            return
+        if tyre not in CONSTANTS['TYRE_SPEED']:
+            await interaction.response.send_message("Invalid tyre type! Use soft, medium, hard, intermediate, or wet.", ephemeral=True)
+            return
+        if strategy not in CONSTANTS['STRATEGY_MODIFIER']:
+            await interaction.response.send_message("Invalid strategy! Use push, balanced, or save.", ephemeral=True)
+            return
+        weather_schedule = race_state.race_lobbies[channel_id]['weather_schedule']
+        first_weather = weather_schedule[0][2]
+        if tyre in ['intermediate', 'wet'] and first_weather not in ['Light Rain', 'Heavy Rain']:
+            await interaction.response.send_message("Intermediates and wets are only usable in rain conditions.", ephemeral=True)
+            return
+        if tyre == 'wet' and first_weather != 'Heavy Rain':
+            await interaction.response.send_message("Wet tyres are only usable in Heavy Rain.", ephemeral=True)
+            return
+        race_state.player_race_data[user_id]['initial_tyre'] = tyre
+        race_state.player_race_data[user_id]['strategy'] = strategy
+        await interaction.response.send_message(
+            f"{interaction.user.mention} set initial tyre to {CONSTANTS['TYRE_EMOJI'][tyre]} {tyre.upper()} and strategy to {strategy.capitalize()}.",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="addai", description="Add AI players to the lobby.")
+@app_commands.describe(number="Number of AI players to add (max 5)")
+async def addai(interaction: discord.Interaction, number: int):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby exists in this channel.", ephemeral=True)
+            return
+        if number < 1 or number > 5:
+            await interaction.response.send_message("Number of AI players must be between 1 and 5.", ephemeral=True)
+            return
+        available_ais = [ai for ai in CONSTANTS['AI_PLAYER_NAMES'] if ai not in race_state.race_lobbies[channel_id]['players']]
+        if len(available_ais) < number:
+            await interaction.response.send_message(f"Only {len(available_ais)} AI players available.", ephemeral=True)
+            return
+        added_ais = available_ais[:number]
+        weather_schedule = race_state.race_lobbies[channel_id]['weather_schedule']
+        first_weather = weather_schedule[0][2]
+        for ai_name in added_ais:
+            race_state.race_lobbies[channel_id]['players'].append(ai_name)
+            initial_tyre = random.choice(['intermediate' if first_weather in ['Light Rain', 'Heavy Rain'] else 'soft',
+                                        'wet' if first_weather == 'Heavy Rain' else 'medium', 'hard'])
+            race_state.player_race_data[ai_name] = {
+                'tyres': CONSTANTS['DEFAULT_TYRES'].copy(),
+                'initial_tyre': initial_tyre,
+                'strategy': random.choice(['push', 'balanced', 'save']),
+                'current_tyre': None,
+                'current_tyre_wear': 0,
+                'stint_laps': 0,
+                'laps_completed': 0,
+                'total_time': 0.0,
+                'last_lap_time': 0.0,
+                'dnf': False,
+                'dnf_reason': None,
+                'last_pit_lap': 0
+            }
+            initialize_career_stats(ai_name)
+        await interaction.response.send_message(f"Added {number} AI players: {', '.join([ai[3:] for ai in added_ais])}")
+
+@bot.tree.command(name="start", description="Start the race for this lobby.")
+async def start(interaction: discord.Interaction):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        logger.info(f"Attempting to start race in channel {channel_id}")
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby to start.", ephemeral=True)
+            return
+        if race_state.active_race:
+            await interaction.response.send_message("A race is already in progress!", ephemeral=True)
+            return
+        if str(interaction.user.id) != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message("Only the lobby host can start the race!", ephemeral=True)
+            return
+        lobby_players_list = race_state.race_lobbies[channel_id]['players']
+        logger.info(f"lobby_players_list type: {type(lobby_players_list)}, value: {lobby_players_list}")
+        if not isinstance(lobby_players_list, list):
+            logger.error(f"Expected lobby_players_list to be a list, got {type(lobby_players_list)}: {lobby_players_list}")
+            await interaction.response.send_message(
+                "Internal error: Invalid player list. Please use /yeet to delete the lobby and recreate it with /create.",
+                ephemeral=True
+            )
+            for player in race_state.race_lobbies[channel_id].get('players', []):
+                race_state.player_race_data.pop(player, None)
+            del race_state.race_lobbies[channel_id]
+            return
+        if not lobby_players_list:
+            await interaction.response.send_message("No players in the lobby!", ephemeral=True)
+            return
+        for pid in lobby_players_list:
+            if not race_state.career_stats[pid]['selected_driver'] or not race_state.career_stats[pid]['selected_car']:
+                await interaction.response.send_message(
+                    f"Player {'<@' + pid + '>' if not pid.startswith('AI_') else pid[3:]} has not selected a driver or car!",
+                    ephemeral=True
+                )
+                return
+        race_state.race_lobbies[channel_id]['podium_rewards'] = len(lobby_players_list) >= 6
+        if race_state.race_lobbies[channel_id]['mode'] == 'duo':
+            players_list = list(lobby_players_list)
+            random.shuffle(players_list)
+            race_state.race_lobbies[channel_id]['teams'] = {}
+            for i in range(0, len(players_list), 2):
+                team_id = i // 2 + 1
+                team = players_list[i:i+2]
+                if len(team) == 1:
+                    ai_name = random.choice([ai for ai in CONSTANTS['AI_PLAYER_NAMES'] if ai not in players_list])
+                    team.append(ai_name)
+                    race_state.race_lobbies[channel_id]['players'].append(ai_name)
+                    race_state.player_race_data[ai_name] = {
+                        'tyres': CONSTANTS['DEFAULT_TYRES'].copy(),
+                        'initial_tyre': random.choice(['soft', 'medium', 'hard']),
+                        'strategy': random.choice(['push', 'balanced', 'save']),
+                        'current_tyre': None,
+                        'current_tyre_wear': 0,
+                        'stint_laps': 0,
+                        'laps_completed': 0,
+                        'total_time': 0.0,
+                        'last_lap_time': 0.0,
+                        'dnf': False,
+                        'dnf_reason': None,
+                        'last_pit_lap': 0
+                    }
+                    initialize_career_stats(ai_name)
+                    driver_card = generate_card('driver')
+                    car_card = generate_card('car')
+                    race_state.career_stats[ai_name]['driver_cards'].append(driver_card.__dict__)
+                    race_state.career_stats[ai_name]['car_cards'].append(car_card.__dict__)
+                    race_state.career_stats[ai_name]['selected_driver'] = driver_card.card_id
+                    race_state.career_stats[ai_name]['selected_car'] = car_card.card_id
+                race_state.race_lobbies[channel_id]['teams'][team_id] = team
+            logger.info(f"Teams assigned: {race_state.race_lobbies[channel_id]['teams']}")
+        for pid in list(race_state.player_race_data.keys()):
+            if pid not in lobby_players_list:
+                race_state.player_race_data.pop(pid, None)
+        race_state.current_race_players = set(lobby_players_list)
+        weather_schedule = race_state.race_lobbies[channel_id]['weather_schedule']
+        first_weather = weather_schedule[0][2]
+        for pid in lobby_players_list:
+            if pid not in race_state.player_race_data:
+                race_state.player_race_data[pid] = {
+                    'tyres': CONSTANTS['DEFAULT_TYRES'].copy(),
+                    'initial_tyre': None,
+                    'strategy': None,
+                    'current_tyre': None,
+                    'current_tyre_wear': 0,
+                    'stint_laps': 0,
+                    'laps_completed': 0,
+                    'total_time': 0.0,
+                    'last_lap_time': 0.0,
+                    'dnf': False,
+                    'dnf_reason': None,
+                    'last_pit_lap': 0
+                }
+            initialize_career_stats(pid)
+            race_state.career_stats[pid]['races_entered'] += 1
+            if not race_state.player_race_data[pid]['initial_tyre']:
+                race_state.player_race_data[pid]['initial_tyre'] = (
+                    'intermediate' if first_weather in ['Light Rain', 'Heavy Rain'] else
+                    'wet' if first_weather == 'Heavy Rain' else
+                    random.choice(['soft', 'medium', 'hard'])
+                )
+            if not race_state.player_race_data[pid]['strategy']:
+                race_state.player_race_data[pid]['strategy'] = 'balanced'
+            race_state.player_race_data[pid]['current_tyre'] = race_state.player_race_data[pid]['initial_tyre']
+            race_state.player_race_data[pid]['tyres'][race_state.player_race_data[pid]['current_tyre']] -= 1
+        save_career_stats()
+        logger.info(f"Starting race with players: {lobby_players_list}")
+        await interaction.response.send_message("🏁 Race is starting! Simulating laps... Check your DMs for the Driver Control Panel!")
+        race_state.active_race = channel_id
+    await simulate_race(interaction.channel, lobby_players_list)
+    async with race_state.lobbies_lock:
+        del race_state.race_lobbies[channel_id]
+        save_career_stats()
+        race_state.active_race = None
+        race_state.current_race_players.clear()
+
+@bot.tree.command(name="yeet", description="Delete the race lobby in this channel (host only).")
+async def yeet(interaction: discord.Interaction):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby exists in this channel.", ephemeral=True)
+            return
+        if str(interaction.user.id) != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message("Only the lobby host can yeet the lobby!", ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message("Cannot yeet the lobby during an active race!", ephemeral=True)
+            return
+        for player in race_state.race_lobbies[channel_id]['players']:
+            race_state.player_race_data.pop(player, None)
+        del race_state.race_lobbies[channel_id]
+        embed = discord.Embed(
+            title="Race Lobby Yeeted",
+            description=f"🏁 The race lobby has been deleted by {interaction.user.mention}!",
+            color=0xff0000
+        )
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="kick", description="Kick a player from the race lobby (host only).")
+@app_commands.describe(user="The user to kick from the lobby")
+async def kick(interaction: discord.Interaction, user: discord.User):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby exists in this channel.", ephemeral=True)
+            return
+        if str(interaction.user.id) != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message("Only the lobby host can kick players!", ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message("Cannot kick players during an active race!", ephemeral=True)
+            return
+        user_id = str(user.id)
+        if user_id not in race_state.race_lobbies[channel_id]['players']:
+            await interaction.response.send_message(f"{user.mention} is not in the race lobby!", ephemeral=True)
+            return
+        if user_id == race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message("The host cannot be kicked!", ephemeral=True)
+            return
+        race_state.race_lobbies[channel_id]['players'].remove(user_id)
+        race_state.player_race_data.pop(user_id, None)
+        await interaction.response.send_message(f"{user.mention} has been kicked from the race lobby by {interaction.user.mention}!")
+
+@bot.tree.command(name="leave", description="Leave the race lobby.")
+async def leave(interaction: discord.Interaction):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby exists in this channel.", ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message("Cannot leave during an active race!", ephemeral=True)
+            return
+        user_id = str(interaction.user.id)
+        if user_id not in race_state.race_lobbies[channel_id]['players']:
+            await interaction.response.send_message("You are not in the race lobby!", ephemeral=True)
+            return
+        if user_id == race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message("The host cannot leave! Use /yeet to delete the lobby.", ephemeral=True)
+            return
+        race_state.race_lobbies[channel_id]['players'].remove(user_id)
+        race_state.player_race_data.pop(user_id, None)
+        await interaction.response.send_message(f"{interaction.user.mention} has left the race lobby!")
+
+@bot.tree.command(name="tracks", description="View all available race tracks.")
+async def tracks(interaction: discord.Interaction):
+    track_list = "\n".join([f"**{track}**: {CONSTANTS['TRACKS'][track].laps} laps" for track in sorted(CONSTANTS['TRACKS'].keys())])
+    embed = discord.Embed(title="🏎️ Available Tracks", description=track_list, color=0x00ff00)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="profile", description="View your career profile.")
+async def profile(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    fastest_lap_display = "N/A" if stats['fastest_lap'] == 0 else str(stats['fastest_lap'])
+    description = (
+        f"**Races**\n{stats['races_entered']}\n"
+        f"**Wins**\n{stats['wins']}\n"
+        f"**Podiums**\n{stats['podiums']}\n"
+        f"**DNFs**\n{stats['dnfs']}\n"
+        f"**Fastest Lap**\n{fastest_lap_display}\n"
+        f"**Points**\n{stats['points']}"
+    )
+    embed = discord.Embed(title=f"🏎️ {interaction.user.name}’s Career Profile", description=description, color=0x00ff00)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="coins", description="View your ZCoin balance.")
+async def coins(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    embed = discord.Embed(
+        title=f"🏎️ {interaction.user.name}’s ZCoin Balance",
+        description=f"<:ZCoin:1382982386471669820> ZCoins: {stats['zcoins']}",
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="daily", description="Claim your daily ZCoin reward.")
+async def daily(interaction: discord.Interaction):
+    async with race_state.lobbies_lock:
+        user_id = str(interaction.user.id)
+        initialize_career_stats(user_id)
+        current_time = time.time()
+        last_daily = race_state.career_stats[user_id]['last_daily']
+        if current_time - last_daily < 24 * 3600:
+            hours_left = (24 * 3600 - (current_time - last_daily)) / 3600
+            embed = discord.Embed(
+                title="Daily Reward Unavailable",
+                description=f"You can claim your next daily reward in {hours_left:.1f} hours.",
+                color=0xff0000
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+        race_state.career_stats[user_id]['zcoins'] += 100
+        race_state.career_stats[user_id]['last_daily'] = current_time
+        save_career_stats()
+        embed = discord.Embed(
+            title="Daily Reward Claimed",
+            description=f"<:ZCoin:1382982386471669820> You claimed your daily reward of 100 ZCoins!",
+            color=0x00ff00
+        )
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="weekly", description="Claim your weekly reward.")
+async def weekly(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    current_time = int(time.time())
+    if race_state.career_stats[user_id]['last_weekly'] + 604800 > current_time:
+        remaining = (race_state.career_stats[user_id]['last_weekly'] + 604800 - current_time)
+        hours, remainder = divmod(remaining, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        await interaction.response.send_message(f"You can claim your next weekly reward in {hours}h {minutes}m {seconds}s!", ephemeral=True)
+        return
+    race_state.career_stats[user_id]['last_weekly'] = current_time
+    race_state.career_stats[user_id]['zcoins'] += 300
+    pack_type = random.choices(['silver', 'gold'], weights=[0.8, 0.2])[0]  # Updated weights
+    race_state.career_stats[user_id][f'{pack_type}_packs'] += 1
+    save_career_stats()
+    embed = discord.Embed(
+        title="Weekly Reward Claimed!",
+        description=f"You received:\n<:ZCoin:1382982386471669820> **300 ZCoins**\n**{pack_type.capitalize()} Pack**",  # Updated to Silver/Gold
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="monthly", description="Claim your monthly reward.")
+async def monthly(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    current_time = int(time.time())
+    if race_state.career_stats[user_id]['last_monthly'] + 2592000 > current_time:
+        remaining = (race_state.career_stats[user_id]['last_monthly'] + 2592000 - current_time)
+        days, remainder = divmod(remaining, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        await interaction.response.send_message(f"You can claim your next monthly reward in {days}d {hours}h {minutes}m {seconds}s!", ephemeral=True)
+        return
+    race_state.career_stats[user_id]['last_monthly'] = current_time
+    race_state.career_stats[user_id]['zcoins'] += 1000
+    pack_type = random.choices(['silver', 'gold'], weights=[0.5, 0.5])[0]  # Updated weights
+    race_state.career_stats[user_id][f'{pack_type}_packs'] += 1
+    save_career_stats()
+    embed = discord.Embed(
+        title="Monthly Reward Claimed!",
+        description=f"You received:\n<:ZCoin:1382982386471669820> **1000 ZCoins**\n**{pack_type.capitalize()} Pack**",  # Updated to Silver/Gold
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="cm", description="Change race mode to solo or duo")
+@app_commands.describe(mode="Race mode: solo or duo")
+async def change_mode(interaction: discord.Interaction, mode: str):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="No race lobby exists in this channel.", color=0xff0000), ephemeral=True)
+            return
+        if str(interaction.user.id) != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Only the lobby host can change the mode!", color=0xff0000), ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Cannot change mode during an active race!", color=0xff0000), ephemeral=True)
+            return
+        if mode.lower() not in ['solo', 'duo']:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Invalid mode! Use 'solo' or 'duo'.", color=0xff0000), ephemeral=True)
+            return
+        if mode.lower() == 'duo' and len(race_state.race_lobbies[channel_id]['players']) % 2 != 0:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Cannot switch to duo mode with an odd number of players!", color=0xff0000), ephemeral=True)
+            return
+        race_state.race_lobbies[channel_id]['mode'] = mode.lower()
+        if mode.lower() == 'duo':
+            players_list = list(race_state.race_lobbies[channel_id]['players'])
+            random.shuffle(players_list)
+            race_state.race_lobbies[channel_id]['teams'] = {}
+            for i in range(0, len(players_list), 2):
+                team_id = i // 2 + 1
+                team = players_list[i:i+2]
+                race_state.race_lobbies[channel_id]['teams'][team_id] = team
+            logger.info(f"Teams assigned for duo mode: {race_state.race_lobbies[channel_id]['teams']}")
+        else:
+            race_state.race_lobbies[channel_id]['teams'] = {}
+            race_state.race_lobbies[channel_id]['team_names'] = {}
+        embed = discord.Embed(title="Race Mode Changed", description=f"Race mode set to **{mode.lower()}**!", color=0x00ff00)
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="swap", description="Swap two players between teams (host only, duo mode only)")
+@app_commands.describe(player1="First player to swap", player2="Second player to swap")
+async def swap(interaction: discord.Interaction, player1: discord.User, player2: discord.User):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="No race lobby exists in this channel.", color=0xff0000), ephemeral=True)
+            return
+        if str(interaction.user.id) != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Only the lobby host can swap players!", color=0xff0000), ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Cannot swap players during an active race!", color=0xff0000), ephemeral=True)
+            return
+        if race_state.race_lobbies[channel_id]['mode'] != 'duo':
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Swapping is only available in duo mode!", color=0xff0000), ephemeral=True)
+            return
+        if not race_state.race_lobbies[channel_id]['teams']:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="No teams assigned yet! Use /cm duo to assign teams.", color=0xff0000), ephemeral=True)
+            return
+        player1_id = str(player1.id)
+        player2_id = str(player2.id)
+        if player1_id == player2_id:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Cannot swap a player with themselves!", color=0xff0000), ephemeral=True)
+            return
+        team1_id = team2_id = None
+        for tid, players in race_state.race_lobbies[channel_id]['teams'].items():
+            if player1_id in players:
+                team1_id = tid
+            if player2_id in players:
+                team2_id = tid
+        if team1_id is None or team2_id is None:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="One or both players are not in any team!", color=0xff0000), ephemeral=True)
+            return
+        if team1_id == team2_id:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Players are already in the same team!", color=0xff0000), ephemeral=True)
+            return
+        race_state.race_lobbies[channel_id]['teams'][team1_id].remove(player1_id)
+        race_state.race_lobbies[channel_id]['teams'][team1_id].append(player2_id)
+        race_state.race_lobbies[channel_id]['teams'][team2_id].remove(player2_id)
+        race_state.race_lobbies[channel_id]['teams'][team2_id].append(player1_id)
+        team1_name = race_state.race_lobbies[channel_id]['team_names'].get(team1_id, f'Team {team1_id}')
+        team2_name = race_state.race_lobbies[channel_id]['team_names'].get(team2_id, f'Team {team2_id}')
+        embed = discord.Embed(
+            title="Players Swapped",
+            description=f"{player1.mention} (now in {team2_name}) and {player2.mention} (now in {team1_name}) have been swapped!",
+            color=0x00ff00)
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="ctn", description="Change a team's name (host only, duo mode only)")
+@app_commands.describe(team_id="Team number to rename", new_name="New team name")
+async def change_team_name(interaction: discord.Interaction, team_id: int, new_name: str):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="No race lobby exists in this channel.", color=0xff0000), ephemeral=True)
+            return
+        if interaction.user.name != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Only the lobby host can change team names!", color=0xff0000), ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Cannot change team names during an active race!", color=0xff0000), ephemeral=True)
+            return
+        if race_state.race_lobbies[channel_id]['mode'] != 'duo':
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description="Team name changes are only available in duo mode!", color=0xff0000), ephemeral=True)
+            return
+        if team_id not in race_state.race_lobbies[channel_id]['teams']:
+            await interaction.response.send_message(embed=discord.Embed(
+                title="Error", description=f"Team {team_id} does not exist!", color=0xff0000), ephemeral=True)
+            return
+        race_state.race_lobbies[channel_id]['team_names'][team_id] = new_name
+        logger.info(f"Team {team_id} renamed to {new_name}")
+        embed = discord.Embed(title="Team Name Changed", description=f"Team {team_id} is now named '{new_name}'!", color=0x00ff00)
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="help", description="View the game guide or detailed command information.")
+async def help(interaction: discord.Interaction):
+    # Game Guide Content
+    game_guide = (
+        "**🏎️ FZ Game Guide**\n\n"
+        "**Overview**\n"
+        "This bot simulates an F1 racing experience in Discord. Create or join race lobbies, choose your tyres and strategy, and compete against other players or AI on various tracks with dynamic weather and track conditions!\n\n"
+        "**Key Mechanics**\n"
+        "- **Race Lobbies**: Create a lobby with `/create` and join with `/join`. The host can start the race with `/start` or delete it with `/yeet`.\n"
+        "- **Tyres**: Choose from soft, medium, hard, intermediate, or wet tyres. Each has different speed and wear rates. Use `/setup` to select your initial tyre and `/pit` during the race to change tyres.\n"
+        "- **Strategies**: Select push, balanced, or save strategies with `/setup` or change during the race with `/strategy`. Push is faster but wears tyres more; save is slower but conserves tyres.\n"
+        "- **Weather and Track Conditions**: Weather (Sunny, Cloudy, Light Rain, Heavy Rain, Foggy) and track conditions (High Grip, Low Grip, Oil Spill, High Downforce) affect lap times, tyre wear, and DNF chances.\n"
+        "- **DNFs**: Players can DNF due to tyre wear, collisions, or random events like mechanical failures. Safety cars may deploy, slowing the race.\n"
+        "- **Scoring**: Top 10 finishers earn points (25, 18, 15, 12, 10, 8, 6, 4, 2, 1). Podium finishes in lobbies with 6+ players earn ZCoins (300, 200, 100).\n"
+        "- **Career Stats**: Track your races, wins, podiums, DNFs, fastest laps, and points with `/profile`. Earn ZCoins via races or daily/weekly/monthly rewards (`/daily`, `/weekly`, `/monthly`).\n"
+        "- **Duo Mode**: In duo mode (`/cm duo`), players are paired into teams, and team points are calculated based on individual finishes.\n\n"
+        "**Tips**\n"
+        "- Check weather with `/lobby` to pick the right tyres. Intermediates and wets are only for rain; wets are specific to Heavy Rain.\n"
+        "- Monitor tyre wear with `/status` and pit strategically to avoid DNFs.\n"
+        "- In duo mode, coordinate with your teammate for optimal strategies.\n"
+        "- Claim ZCoins regularly to build your balance for future features!"
+    )
+
+    # Command Information
+    commands_info = {
+        "create": {
+            "description": "Create a race lobby in the current channel.",
+            "usage": "/create [track] (optional, e.g., 'Monaco')",
+            "details": "Sets up a race lobby with a chosen or random track, weather schedule, and track condition. Only one lobby per channel."
+        },
+        "join": {
+            "description": "Join the race lobby in the current channel.",
+            "usage": "/join",
+            "details": "Adds you to the lobby. You can then set your tyre and strategy with `/setup`."
+        },
+        "lobby": {
+            "description": "View the current race lobby details.",
+            "usage": "/lobby",
+            "details": "Shows track, weather, track condition, players/teams, and their setups (tyre/strategy)."
+        },
+        "setup": {
+            "description": "Set your initial tyre and strategy for the race.",
+            "usage": "/setup <tyre> <strategy>",
+            "details": "Tyre: soft, medium, hard, intermediate, wet. Strategy: push, balanced, save. Must match weather conditions (e.g., wets for Heavy Rain)."
+        },
+        "addai": {
+            "description": "Add AI players to the lobby (1-5).",
+            "usage": "/addai <number>",
+            "details": "Adds AI drivers (e.g., Max Verstappen) with random tyres and strategies. Max 5 AI players."
+        },
+        "start": {
+            "description": "Start the race (host only).",
+            "usage": "/start",
+            "details": "Begins the race simulation. All players must have tyres/strategies set, or defaults are assigned."
+        },
+        "pit": {
+            "description": "Change tyres during the race.",
+            "usage": "/pit <tyre_type>",
+            "details": "Switches to a new tyre (if available) and resets wear. Adds a pit stop time penalty (20-25s + weather/condition modifiers)."
+        },
+        "strategy": {
+            "description": "Change your racing strategy during the race.",
+            "usage": "/strategy <strategy_type>",
+            "details": "Switch to push, balanced, or save. Affects lap times and tyre wear."
+        },
+        "status": {
+            "description": "Check your car status during the race.",
+            "usage": "/status",
+            "details": "Shows current tyre, wear, remaining tyres, strategy, laps completed, and total time."
+        },
+        "yeet": {
+            "description": "Delete the race lobby (host only).",
+            "usage": "/yeet",
+            "details": "Removes the lobby and all player data. Cannot be used during an active race."
+        },
+        "kick": {
+            "description": "Kick a player from the lobby (host only).",
+            "usage": "/kick <user>",
+            "details": "Removes a player from the lobby. Cannot kick the host or during an active race."
+        },
+        "leave": {
+            "description": "Leave the race lobby.",
+            "usage": "/leave",
+            "details": "Removes you from the lobby. The host cannot leave; use `/yeet` instead."
+        },
+        "tracks": {
+            "description": "View all available race tracks.",
+            "usage": "/tracks",
+            "details": "Lists all tracks with their lap counts."
+        },
+        "profile": {
+            "description": "View your career profile.",
+            "usage": "/profile",
+            "details": "Shows races entered, wins, podiums, DNFs, fastest laps, and points."
+        },
+        "coins": {
+            "description": "View your ZCoin balance.",
+            "usage": "/coins",
+            "details": "Displays your current ZCoin balance earned from races or rewards."
+        },
+        "daily": {
+            "description": "Claim your daily ZCoin reward (100 ZCoins).",
+            "usage": "/daily",
+            "details": "Available every 24 hours."
+        },
+        "weekly": {
+            "description": "Claim your weekly ZCoin reward (500 ZCoins).",
+            "usage": "/weekly",
+            "details": "Available every 7 days."
+        },
+        "monthly": {
+            "description": "Claim your monthly ZCoin reward (2000 ZCoins).",
+            "usage": "/monthly",
+            "details": "Available every 30 days."
+        },
+        "cm": {
+            "description": "Change race mode to solo or duo (host only).",
+            "usage": "/cm <mode>",
+            "details": "Solo: individual racing. Duo: teams of two (randomly assigned). Requires even number of players for duo."
+        },
+        "swap": {
+            "description": "Swap two players between teams (host only, duo mode).",
+            "usage": "/swap <player1> <player2>",
+            "details": "Swaps two players between different teams in duo mode."
+        },
+        "ctn": {
+            "description": "Change a team's name (host only, duo mode).",
+            "usage": "/ctn <team_id> <new_name>",
+            "details": "Renames a team in duo mode (e.g., Team 1 to 'Red Bull')."
+        },
+        "help": {
+            "description": "View the game guide or command details.",
+            "usage": "/help",
+            "details": "Use the dropdown menu to select the game guide or specific command info."
+        }
+    }
+
+    # Create SelectMenu options
+    options = [
+        SelectOption(label="Game Guide", value="guide", description="Overview of the F1 Racing Bot mechanics"),
+        *[SelectOption(label=f"/{cmd}", value=cmd, description=info["description"]) for cmd, info in commands_info.items()]
+    ]
+
+    # Create SelectMenu
+    select = discord.ui.Select(
+        placeholder="Choose an option...",
+        options=options,
+        min_values=1,
+        max_values=1
+    )
+
+    async def select_callback(interaction: Interaction):
+        selected_value = interaction.data['values'][0]
+        embed = discord.Embed(title="🏎️ F1 Racing Bot Help", color=0x00ff00)
+        
+        if selected_value == "guide":
+            embed.description = game_guide
+        else:
+            cmd_info = commands_info[selected_value]
+            embed.title = f"Command: /{selected_value}"
+            embed.add_field(name="Description", value=cmd_info["description"], inline=False)
+            embed.add_field(name="Usage", value=f"`{cmd_info['usage']}`", inline=False)
+            embed.add_field(name="Details", value=cmd_info["details"], inline=False)
+        
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    select.callback = select_callback
+    view = View()
+    view.add_item(select)
+
+    # Initial embed
+    initial_embed = discord.Embed(
+        title="🏎️ FZ Bot Help",
+        description="Select an option from the dropdown to view the game guide or command details.",
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=initial_embed, view=view)
+
+@bot.tree.command(name="inventory", description="View your inventory of drivers, cars, and packs.")
+async def inventory(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    
+    # Select menu for category choice
+    select = Select(
+        placeholder="Select a category",
+        options=[
+            SelectOption(label="Drivers", value="drivers", description="View your driver cards"),
+            SelectOption(label="Cars", value="cars", description="View your car cards"),
+            SelectOption(label="Packs", value="packs", description="View your pack count")
+        ]
+    )
+
+    async def select_callback(interaction: discord.Interaction):
+        selected = select.values[0]
+        embed = discord.Embed(title=f"{interaction.user.display_name}'s Inventory", color=0x00ff00)
+        
+        if selected == "drivers":
+            driver_cards = stats['driver_cards']
+            driver_text = "\n".join([
+                f"{'🟢' if c['card_id'] == stats['selected_driver'] else ''} {c['name']} ({c['season']}) - {c['rarity']} (ID: {c['card_id']})"
+                for c in driver_cards
+            ]) or "No driver cards."
+            embed.add_field(name="Driver Cards", value=driver_text, inline=False)
+        
+        elif selected == "cars":
+            car_cards = stats['car_cards']
+            car_text = "\n".join([
+                f"{'🟢' if c['card_id'] == stats['selected_car'] else ''} {c['name']} ({c['season']}) - {c['rarity']} (ID: {c['card_id']})"
+                for c in car_cards
+            ]) or "No car cards."
+            embed.add_field(name="Car Cards", value=car_text, inline=False)
+        
+        elif selected == "packs":
+            silver_packs = stats.get('silver_packs', 0)
+            gold_packs = stats.get('gold_packs', 0)
+            pack_text = f"- Silver Packs: {silver_packs}\n- Gold Packs: {gold_packs}"
+            embed.add_field(name="Packs", value=pack_text, inline=False)
+        
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    select.callback = select_callback
+    view = View()
+    view.add_item(select)
+    
+    # Initial response with packs
+    embed = discord.Embed(title=f"{interaction.user.display_name}'s Inventory", color=0x00ff00)
+    silver_packs = stats.get('silver_packs', 0)
+    gold_packs = stats.get('gold_packs', 0)
+    pack_text = f"- Silver Packs: {silver_packs}\n- Gold Packs: {gold_packs}"
+    embed.add_field(name="Packs", value=pack_text, inline=False)
+    await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="selectdriver", description="Select a driver card for racing.")
+@app_commands.describe(card_id="The ID of the driver card to select")
+async def selectdriver(interaction: discord.Interaction, card_id: str):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    driver = next((c for c in stats['driver_cards'] if c['card_id'] == card_id), None)
+    if not driver:
+        await interaction.response.send_message("Invalid driver card ID or you don't own this card!", ephemeral=True)
+        return
+    if race_state.active_race and user_id in race_state.current_race_players:
+        await interaction.response.send_message("Cannot change driver during an active race!", ephemeral=True)
+        return
+    stats['selected_driver'] = card_id
+    save_career_stats()
+    await interaction.response.send_message(f"Selected driver: {driver['name']} ({driver['season']})")
+
+@bot.tree.command(name="selectcar", description="Select a car card for racing.")
+@app_commands.describe(card_id="The ID of the car card to select")
+async def selectcar(interaction: discord.Interaction, card_id: str):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    car = next((c for c in stats['car_cards'] if c['card_id'] == card_id), None)
+    if not car:
+        await interaction.response.send_message("Invalid car card ID or you don't own this card!", ephemeral=True)
+        return
+    if race_state.active_race and user_id in race_state.current_race_players:
+        await interaction.response.send_message("Cannot change car during an active race!", ephemeral=True)
+        return
+    stats['selected_car'] = card_id
+    save_career_stats()
+    await interaction.response.send_message(f"Selected car: {car['name']} ({car['season']})")
+
+@bot.tree.command(name="mydriver", description="View details of your equipped driver card.")
+async def mydriver(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    driver = next((c for c in stats['driver_cards'] if c['card_id'] == stats['selected_driver']), None)
+    if not driver:
+        await interaction.response.send_message("No driver card selected!", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"Equipped Driver: {driver['name']}", color=0x00ff00)
+    embed.add_field(name="Season", value=driver['season'], inline=True)
+    embed.add_field(name="Attack", value=driver['attack'], inline=True)
+    embed.add_field(name="Defence", value=driver['defence'], inline=True)
+    embed.add_field(name="Rarity", value=driver['rarity'], inline=True)
+    embed.add_field(name="Card ID", value=driver['card_id'], inline=True)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="mycar", description="View details of your equipped car card.")
+async def mycar(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    car = next((c for c in stats['car_cards'] if c['card_id'] == stats['selected_car']), None)
+    if not car:
+        await interaction.response.send_message("No car card selected!", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"Equipped Car: {car['name']}", color=0x00ff00)
+    embed.add_field(name="Year", value=car['season'], inline=True)
+    embed.add_field(name="Attack", value=car['attack'], inline=True)
+    embed.add_field(name="Defence", value=car['defence'], inline=True)
+    embed.add_field(name="Rarity", value=car['rarity'], inline=True)
+    embed.add_field(name="Card ID", value=car['card_id'], inline=True)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="driverinfo", description="View details of a specific driver card.")
+@app_commands.describe(card_id="The ID of the driver card to inspect")
+async def driverinfo(interaction: discord.Interaction, card_id: str):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    driver = next((c for c in stats['driver_cards'] if c['card_id'] == card_id), None)
+    if not driver:
+        await interaction.response.send_message("Invalid driver card ID or you don't own this card!", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"Driver: {driver['name']}", color=0x00ff00)
+    embed.add_field(name="Season", value=driver['season'], inline=True)
+    embed.add_field(name="Attack", value=driver['attack'], inline=True)
+    embed.add_field(name="Defence", value=driver['defence'], inline=True)
+    embed.add_field(name="Rarity", value=driver['rarity'], inline=True)
+    embed.add_field(name="Card ID", value=driver['card_id'], inline=True)
+    embed.add_field(name="Equipped", value="Yes" if driver['card_id'] == stats['selected_driver'] else "No", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="carinfo", description="View details of a specific car card.")
+@app_commands.describe(card_id="The ID of the car card to inspect")
+async def carinfo(interaction: discord.Interaction, card_id: str):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+    car = next((c for c in stats['car_cards'] if c['card_id'] == card_id), None)
+    if not car:
+        await interaction.response.send_message("Invalid car card ID or you don't own this card!", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"Car: {car['name']}", color=0x00ff00)
+    embed.add_field(name="Year", value=car['season'], inline=True)
+    embed.add_field(name="Attack", value=car['attack'], inline=True)
+    embed.add_field(name="Defence", value=car['defence'], inline=True)
+    embed.add_field(name="Rarity", value=car['rarity'], inline=True)
+    embed.add_field(name="Card ID", value=car['card_id'], inline=True)
+    embed.add_field(name="Equipped", value="Yes" if car['card_id'] == stats['selected_car'] else "No", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+# Note: Only the new commands are included here, to be added to the existing bot.py
+
+@bot.tree.command(name="settrack", description="Set or change the track for the race lobby (host only).")
+@app_commands.describe(track="The track to set for the race")
+async def settrack(interaction: discord.Interaction, track: str):
+    async with race_state.lobbies_lock:
+        channel_id = interaction.channel.id
+        if channel_id not in race_state.race_lobbies:
+            await interaction.response.send_message("No race lobby exists in this channel.", ephemeral=True)
+            return
+        if str(interaction.user.id) != race_state.race_lobbies[channel_id]['host']:
+            await interaction.response.send_message("Only the lobby host can set the track!", ephemeral=True)
+            return
+        if race_state.active_race == channel_id:
+            await interaction.response.send_message("Cannot change track during an active race!", ephemeral=True)
+            return
+        if track not in CONSTANTS['TRACKS']:
+            await interaction.response.send_message(
+                f"Invalid track! Available tracks: {', '.join(CONSTANTS['TRACKS'].keys())}", ephemeral=True
+            )
+            return
+        race_state.race_lobbies[channel_id]['track'] = track
+        race_state.race_lobbies[channel_id]['track_condition'] = random.choices(
+            CONSTANTS['TRACK_CONDITIONS'], CONSTANTS['TRACKS'][track].condition_weights
+        )[0]
+        race_state.race_lobbies[channel_id]['weather_schedule'] = generate_weather_schedule(
+            CONSTANTS['TRACKS'][track].laps, track
+        )
+        weather_desc = "\n".join([
+            f"{CONSTANTS['WEATHER_EMOJI'][weather]} {weather}: Laps {start}-{end}"
+            for start, end, weather in race_state.race_lobbies[channel_id]['weather_schedule']
+        ])
+        embed = discord.Embed(
+            title="Track Updated",
+            description=(
+                f"🏁 Track set to **{track}** by {interaction.user.mention}\n"
+                f"**Track condition**: {race_state.race_lobbies[channel_id]['track_condition']}\n"
+                f"**Laps**: {CONSTANTS['TRACKS'][track].laps}\n\n"
+                f"**Weather schedule**:\n{weather_desc}"
+            ),
+            color=0x00ff00
+        )
+        await interaction.response.send_message(embed=embed)
+
+class LeaderboardSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Points", value="points"),
+            discord.SelectOption(label="Wins", value="wins"),
+            discord.SelectOption(label="Podiums", value="podiums"),
+            discord.SelectOption(label="DNFs", value="dnfs"),
+            discord.SelectOption(label="Fastest Laps", value="fastest_lap"),
+            discord.SelectOption(label="Races Entered", value="races_entered")
+        ]
+        super().__init__(placeholder="Select a stat to view...", options=options, custom_id="leaderboard_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        stat = self.values[0]
+        stat_display = {
+            'points': 'Points', 'wins': 'Wins', 'podiums': 'Podiums', 'dnfs': 'DNFs',
+            'fastest_lap': 'Fastest Laps', 'races_entered': 'Races Entered'
+        }[stat]
+        players = [
+            (pid, stats[stat], stats['selected_driver'], stats['selected_car'])
+            for pid, stats in race_state.career_stats.items()
+            if not pid.startswith('AI_')
+        ]
+        players.sort(key=lambda x: x[1], reverse=True)
+        description = f"**Leaderboard: {stat_display}**\n\n"
+        for i, (pid, value, selected_driver, selected_car) in enumerate(players[:10], 1):
+            driver = next((c for c in race_state.career_stats[pid]['driver_cards'] if c['card_id'] == selected_driver), None)
+            car = next((c for c in race_state.career_stats[pid]['car_cards'] if c['card_id'] == selected_car), None)
+            driver_name = driver['name'] if driver else 'None'
+            car_name = car['name'] if car else 'None'
+            description += (
+                f"**{i}.** <@{pid}> - **{value}** {stat_display}\n"
+                f"   Driver: {driver_name} | Car: {car_name}\n"
+            )
+        if not players:
+            description += "No player stats available yet."
+        embed = discord.Embed(title="🏆 Formula Z Leaderboard", description=description, color=0x00ff00)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+@bot.tree.command(name="leaderboard", description="View the leaderboard for player stats.")
+async def leaderboard(interaction: discord.Interaction):
+    view = discord.ui.View()
+    view.add_item(LeaderboardSelect())
+    embed = discord.Embed(
+        title="🏆 Formula Z Leaderboard",
+        description="Select a stat to view the leaderboard.",
+        color=0x00ff00
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="openpack", description="Open a silver or gold pack from your inventory.")
+@app_commands.describe(pack_type="Choose the pack type to open (silver or gold)")
+async def openpack(interaction: discord.Interaction, pack_type: Literal["silver", "gold"]):
+    user_id = str(interaction.user.id)
+    initialize_career_stats(user_id)
+    stats = race_state.career_stats[user_id]
+
+    pack_count_key = f"{pack_type}_packs"
+    if stats.get(pack_count_key, 0) < 1:
+        await interaction.response.send_message(f"You don't have any {pack_type.capitalize()} Packs to open!", ephemeral=True)
+        return
+
+    stats[pack_count_key] -= 1
+    rarities = list(CONSTANTS['PACK_CONTENTS'][pack_type].keys())
+    weights = list(CONSTANTS['PACK_CONTENTS'][pack_type].values())
+    rarity = random.choices(rarities, weights=weights, k=1)[0]
+    card_type = random.choice(['driver', 'car'])
+    card = generate_card(card_type, rarity)  # Use generate_card for proper stats
+    if card_type == 'driver':
+        stats['driver_cards'].append(card.__dict__)
+    else:
+        stats['car_cards'].append(card.__dict__)
+    save_career_stats()
+
+    embed = discord.Embed(
+        title=f"{pack_type.capitalize()} Pack Opened!",
+        description=f"You received: **{card.name} ({card.rarity})** ({card.type.capitalize()} Card, ID: {card.card_id})",
+        color=0x00ff00
+    )
+    embed.add_field(
+        name="Remaining Packs",
+        value=f"- Silver Packs: {stats.get('silver_packs', 0)}\n- Gold Packs: {stats.get('gold_packs', 0)}",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed)
+
+async def setup_aiohttp_session():
+    resolver = aiohttp.resolver.AsyncResolver()
+    resolver.nameservers = ['8.8.8.8', '1.1.1.1']
+    connector = aiohttp.TCPConnector(resolver=resolver)
+    session = aiohttp.ClientSession(connector=connector)
+    return session
+
+async def setup_hook():
+    print("Setting up aiohttp session...")
+    session = await setup_aiohttp_session()
+    bot.http._session = session
+    print("aiohttp session set!")
+
+bot.setup_hook = setup_hook
